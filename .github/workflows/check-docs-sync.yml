@@ -1,0 +1,35 @@
+name: docs-sync
+
+# Runs the cross-artifact drift checker on every PR + push to main.
+# Fails the build if README, openapi.yaml, CLAUDE.md, or migrations have
+# drifted from each other.
+
+on:
+  pull_request:
+    paths:
+      - 'README.md'
+      - 'server/openapi.yaml'
+      - 'server/src/static/CLAUDE.md'
+      - 'server/migrations/**'
+      - 'server/src/routes/**'
+      - 'server/src/services/**'
+      - 'scripts/check-docs-sync.mjs'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install minimal deps for the checker
+        # The checker reads js-yaml from client/node_modules, so we only need
+        # to install the client to run it. ~30s vs the full server install.
+        run: cd client && npm ci --no-audit --no-fund --prefer-offline
+      - name: Run docs-sync check
+        run: npm run check:docs

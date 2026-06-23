@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+server/keys/
+*.pem
+.ai/
+
+# Local dev logs (created when launching dev servers via npm run dev > *.log)
+*.log

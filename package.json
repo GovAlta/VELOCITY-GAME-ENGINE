@@ -1,0 +1,26 @@
+{
+  "name": "velo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Velo — Project Tool for AI",
+  "scripts": {
+    "postinstall": "cd server && npm install --include=dev && cd ../client && npm install --include=dev",
+    "install:all": "npm install && cd server && npm install && cd ../client && npm install",
+    "dev:all": "concurrently -n server,client -c blue,green \"cd server && npm run dev\" \"cd client && npm run dev\"",
+    "dev:server": "cd server && npm run dev",
+    "dev:client": "cd client && npm run dev",
+    "build": "cd client && npm run build && cd ../server && npm run build",
+    "start": "cd server && npm run start",
+    "test": "cd server && npm test && cd ../client && npm test",
+    "db:migrate": "cd server && npm run db:migrate",
+    "db:seed": "cd server && npm run db:seed",
+    "db:seed:projects": "cd server && npx tsx src/scripts/seed-projects.ts",
+    "check:docs": "node scripts/check-docs-sync.mjs",
+    "check:docs:json": "node scripts/check-docs-sync.mjs --json",
+    "build:readme": "node scripts/build-readme.mjs",
+    "install:hooks": "git config core.hooksPath scripts/git-hooks && echo Pre-push hook installed."
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}

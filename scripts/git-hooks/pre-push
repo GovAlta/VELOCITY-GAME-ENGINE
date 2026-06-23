@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Velo pre-push hook — runs the doc-sync drift checker before letting a push proceed.
+#
+# Install once (from app/):
+#   npm run install:hooks
+#
+# Bypass intentionally (when you really mean it):
+#   git push --no-verify
+#
+# Why pre-push instead of pre-commit:
+#   • Pre-commit fires on every saved commit; many commits during a feature are
+#     intentionally mid-state and shouldn't be blocked.
+#   • Pre-push fires once before the network round-trip, after the dev has
+#     declared the branch ready for review. That's the right gate.
+
+set -e
+
+# Resolve repo root (this script's parent's parent)
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_ROOT="$(cd "$HERE/.." && pwd)"
+cd "$APP_ROOT"
+
+echo "▶ Running docs-sync check before push…"
+
+if ! node scripts/check-docs-sync.mjs; then
+  echo ""
+  echo "✘ docs-sync found drift. Either fix the issues above or push with --no-verify if you have a specific reason."
+  exit 1
+fi

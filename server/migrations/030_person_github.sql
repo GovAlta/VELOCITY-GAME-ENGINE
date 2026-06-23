@@ -1,0 +1,1 @@
+ALTER TABLE person ADD COLUMN IF NOT EXISTS person_github_handle VARCHAR(100);

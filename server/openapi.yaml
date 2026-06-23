@@ -1,0 +1,3734 @@
+openapi: 3.0.3
+info:
+  title: Velo API
+  version: 4.1.0
+  description: |
+    Project Tool for AI.
+
+    ## Field Naming Convention
+    **All request bodies use camelCase** (e.g. `ministryCode`, `fiscalYear`, `fundingSource`).
+    **All responses use snake_case** DB column names (e.g. `project_name`, `ministry_code`).
+    This is intentional — the controller maps camelCase input to snake_case DB fields.
+
+    ## Authentication
+    Two methods:
+    - **Cookie SSO**: Sign in via `GET /auth/google`, then include `X-CSRF-Token` header on writes.
+    - **API Key**: Include `X-API-Key: velo_xxx` or `Authorization: Bearer velo_xxx` header. No CSRF needed.
+
+    API key actions are attributed to the key owner and flagged as `api_key` in the audit log.
+
+    ## Role-Based Access Control
+    Four roles with multi-role support:
+    - **user**: Read-only viewer — can see projects, dashboards, and data but cannot modify anything
+    - **runner**: Can DO work — velocity game, SharePoint, Git operations, run audits, edit OPEN projects (no active members), and (per project) clone/claim
+    - **project_lead**: Can SET UP work — create/edit/delete projects, modules, budgets, leads, links, Applications & Contracts, persons, canvas + everything runner can do
+    - **admin**: System administration — user management, settings, PAT management, project clone-policy + everything project_lead can do
+
+    Users can hold multiple roles simultaneously. Admin role implicitly grants all permissions.
+    API key access enforces the same role restrictions as browser login.
+
+    ## Project Membership & Locks (v4.0)
+    A project with **zero** active members is **open** — any user with `runner`, `project_lead`, or `admin` role may edit it.
+    A project with **≥1** active member is **claimed** — only its members (and admins) may edit it. Members hold one of two roles:
+    - **owner**: full control — add/remove members, lock, rename version, transfer ownership, complete challenges, delete the project
+    - **collaborator**: may edit (when unlocked) and make velocity moves; cannot manage membership
+
+    A project may be **locked** by any owner. While locked, only the locker (and admins) may mutate the project, its
+    modules, sub-resources, and velocity board. Admins may force-unlock with `force=true`; force-unlocks write a
+    `project_update` of type `decision` so the original locker can see the override.
+
+    ## Cloning & Versions (v4.0)
+    Top-level projects may be cloned by any `runner+`. Cloning is **single-level** — clones cannot themselves be cloned
+    (`422 CLONE_OF_CLONE`). An admin may disable cloning of a specific project (`PATCH /projects/{id}/clone-policy`),
+    in which case clone attempts return `403 CLONE_DISABLED`. Clones inherit metadata, modules, and (optionally) links/budgets;
+    velocity state, members, audit history, and dates reset. The cloner becomes the sole owner of the clone.
+    `project_code` is auto-suffixed `-v1`, `-v2`, …; `project_version_label` is renameable by owners.
+
+    Use `GET /projects/{id}/cluster` to retrieve the parent + all clones of a top-level project.
+
+    ## Optimistic Concurrency: `If-Match` (v4.0)
+    Every project response includes `project_revision` (integer). Every velocity step response includes `step_revision`.
+    Both auto-increment on every `UPDATE` via DB triggers. Clients may include `If-Match: <revision>` on writes:
+    - matching → write succeeds; revision bumps
+    - mismatch → `412 PRECONDITION_FAILED` with `details: [{ field: "currentRevision", message: "<n>" }]`
+    The header is **advisory** — writes without it succeed (with last-write-wins risk).
+    Designed to let multiple AI agents race on the same step without clobbering each other.
+
+    ## Idempotency: `Idempotency-Key` (v4.0)
+    Send `Idempotency-Key: <uuid>` on any non-`GET` request. The server caches successful (`2xx`) responses for **24 hours**
+    keyed on `(uuid, method, path, request-body-hash)`:
+    - Re-sending the same key + body returns the cached response with header `Idempotency-Replayed: true`.
+    - Re-sending the same key with a **different** body returns `422 IDEMPOTENCY_KEY_REUSED`.
+    Designed for agent retry-after-network-failure paths.
+
+servers:
+  - url: http://localhost:3001/api/v1
+
+security:
+  - apiKeyHeader: []
+  - apiKeyBearer: []
+  - cookieAuth: []
+
+components:
+  securitySchemes:
+    cookieAuth: { type: apiKey, in: cookie, name: access_token }
+    apiKeyHeader: { type: apiKey, in: header, name: X-API-Key }
+    apiKeyBearer: { type: http, scheme: bearer }
+
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        error:
+          type: object
+          properties:
+            code: { type: string, example: "VALIDATION_ERROR" }
+            message: { type: string, example: "Invalid input" }
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  message: { type: string }
+            url: { type: string }
+            method: { type: string }
+            timestamp: { type: string, format: date-time }
+
+    ProjectInput:
+      type: object
+      required: [name, ministryCode]
+      properties:
+        projectCode: { type: string, maxLength: 50, example: "PRJ-0400" }
+        name: { type: string, maxLength: 500, example: "My New Project" }
+        description: { type: string, example: "Project description here" }
+        ministryCode:
+          type: string
+          description: "Ministry/department short code"
+          example: "TI"
+          enum: [AE, AU, AI, ACSW, ALSS, CFS, CPE, EDC, EM, EPA, EC, FP, HSHS, IR, INFRA, JETI, JUS, MHA, MA, PPHS, PSES, PSC, SARTR, TI, TS, TEC, TBF]
+        status:
+          type: string
+          default: discovery
+          enum: [discovery, requirements, development, testing, client_review, client_acceptance, completion, on_hold, cancelled]
+        startDate: { type: string, format: date, example: "2026-04-01" }
+        endDate: { type: string, format: date, example: "2027-03-31" }
+        goLiveDateType:
+          type: string
+          nullable: true
+          enum: [legislative, mandated, announced, objective]
+        percentComplete: { type: integer, minimum: 0, maximum: 100, default: 0 }
+        priority: { type: string, example: "High" }
+        demandNumber: { type: string, example: "DMND0001234" }
+        risk: { type: string }
+        additionalInfo: { type: string }
+        branch: { type: string, example: "Software Delivery" }
+        isMissionCritical: { type: boolean, default: false, description: "Whether the project is mission-critical" }
+        # ─── Challenge fields (project_lead/admin only) ───
+        isChallenge:
+          type: boolean
+          default: false
+          description: "Flag this project as a Challenge — appears on /challenges and is acceptable (cloneable) by runner+"
+        challengePoints:
+          type: integer
+          minimum: 0
+          maximum: 10000
+          description: "Total points awarded to the winning acceptance's owner(s). Auto-derived from difficulty by the UI on save (easy=100, medium=250, hard=500, expert=1000), but accepted as an explicit value."
+        challengeMaxDays:
+          type: integer
+          minimum: 1
+          maximum: 30
+          example: 5
+          description: "Target completion window in days. Used to compute the 25% speed bonus when a winner is picked within the window."
+        challengeDifficulty:
+          type: string
+          nullable: true
+          enum: [easy, medium, hard, expert]
+        challengeMaxAcceptances:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          nullable: true
+          description: "Cap on the number of acceptances (clones). NULL = unlimited; integer = first-come, first-served. Tri-state on update — omit the key to keep existing, send null to clear back to unlimited, send an integer to cap."
+
+    ModuleInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 500, example: "Authentication Module" }
+        description: { type: string }
+        status:
+          type: string
+          default: requirements_gathering
+          enum: [requirements_gathering, building, client_review, client_sign_off, delivered, closed, cancelled]
+        startDate: { type: string, format: date, nullable: true }
+        endDate: { type: string, format: date, nullable: true }
+        percentComplete: { type: integer, minimum: 0, maximum: 100, default: 0 }
+        sortOrder: { type: integer, default: 0 }
+        plan: { type: string, description: "AI or manual plan notes" }
+        progress: { type: string }
+        blockers: { type: string }
+
+    BudgetInput:
+      type: object
+      required: [fiscalYear, fundingSource, moneyType]
+      properties:
+        fiscalYear: { type: string, example: "FY26-27", description: "Fiscal year label" }
+        fundingSource:
+          type: string
+          enum: [TI, Ministry, Mixed, Federal, Other]
+          example: "TI"
+        moneyType:
+          type: string
+          enum: [Salary, Operating, Capital]
+          example: "Operating"
+        amount: { type: number, minimum: 0, default: 0, example: 250000 }
+        spent: { type: number, minimum: 0, default: 0, example: 50000 }
+        notes: { type: string }
+
+    LinkInput:
+      type: object
+      required: [type, url]
+      properties:
+        type:
+          type: string
+          enum: [github, confluence, jira, sharepoint, other]
+          example: "github"
+        url: { type: string, format: uri, example: "https://github.com/org/repo" }
+        label: { type: string, example: "Main Repository" }
+        description: { type: string }
+
+    UpdateInput:
+      type: object
+      required: [content]
+      properties:
+        type:
+          type: string
+          default: progress
+          enum: [progress, blocker, plan, risk, decision, milestone, ai_summary, audit_result]
+        title: { type: string, example: "Sprint 3 Complete" }
+        content: { type: string, example: "Completed user auth module and API endpoints." }
+        contentJson: { type: object, description: "Structured JSON for AI-generated summaries" }
+        moduleId: { type: string, format: uuid, nullable: true, description: "Link update to a specific module" }
+        source:
+          type: string
+          default: manual
+          enum: [manual, api, ai_audit, github_webhook, jira_sync, confluence_sync]
+
+    LeadInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, example: "Jane Smith" }
+        personId: { type: string, format: uuid, description: "Link to person table for typeahead lookup" }
+        role:
+          type: string
+          default: team_member
+          enum: [lead, delivery_director, delivery_manager, developer, business_analyst, qa_tester, designer, project_manager, product_owner, architect, data_analyst, devops, scrum_master, stakeholder, sponsor, team_member, other]
+          example: "delivery_director"
+        isPrimary: { type: boolean, default: false }
+        isFte: { type: boolean, default: true }
+        organization: { type: string, example: "CGI", description: "Contractor organization (if not FTE)" }
+
+    DependencyInput:
+      type: object
+      required: [fromProjectId, toProjectId]
+      properties:
+        fromProjectId: { type: string, format: uuid }
+        toProjectId: { type: string, format: uuid }
+        type:
+          type: string
+          default: other
+          enum: [finish_to_start, start_to_start, finish_to_finish, start_to_finish, other]
+          example: "finish_to_start"
+        label: { type: string, example: "Data feed dependency" }
+        notes: { type: string }
+
+    PersonInput:
+      type: object
+      required: [displayName]
+      properties:
+        displayName: { type: string, example: "Jane Smith" }
+        email: { type: string, format: email, example: "jane.smith@example.com" }
+        githubHandle: { type: string, example: "@janesmith" }
+        organization: { type: string, example: "CGI" }
+        isFte: { type: boolean, default: true }
+        notes: { type: string }
+
+    ApiKeyInput:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, example: "Claude Code" }
+        scopes:
+          type: array
+          items: { type: string, enum: [read, write] }
+          default: [read, write]
+        expiresAt: { type: string, format: date, nullable: true }
+
+    ApplicationInput:
+      type: object
+      required: [name, applicationId]
+      properties:
+        applicationId: { type: string, maxLength: 50, example: "APP-0012", description: "Unique application identifier" }
+        name: { type: string, maxLength: 500, example: "Wildfire Management System" }
+        description: { type: string }
+        owner: { type: string, example: "Forestry and Parks" }
+        status:
+          type: string
+          default: active
+          enum: [active, decommissioned, in_development, on_hold]
+        environment: { type: string, enum: [production, staging, development, disaster_recovery] }
+        url: { type: string, format: uri, example: "https://app.example.com" }
+        notes: { type: string }
+
+    ApplicationOutput:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        application_id: { type: string }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        owner: { type: string, nullable: true }
+        status: { type: string }
+        environment: { type: string, nullable: true }
+        url: { type: string, nullable: true }
+        notes: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ContractInput:
+      type: object
+      required: [contractNumber, vendorName]
+      properties:
+        contractNumber: { type: string, maxLength: 100, example: "CON-2026-0045" }
+        vendorName: { type: string, maxLength: 500, example: "CGI" }
+        description: { type: string }
+        startDate: { type: string, format: date, example: "2026-04-01" }
+        endDate: { type: string, format: date, example: "2027-03-31" }
+        value: { type: number, minimum: 0, example: 500000 }
+        status:
+          type: string
+          default: active
+          enum: [active, expired, terminated, pending]
+        notes: { type: string }
+
+    ContractOutput:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        contract_number: { type: string }
+        vendor_name: { type: string }
+        description: { type: string, nullable: true }
+        start_date: { type: string, format: date, nullable: true }
+        end_date: { type: string, format: date, nullable: true }
+        value: { type: number, nullable: true }
+        status: { type: string }
+        notes: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ProjectApplicationLink:
+      type: object
+      required: [applicationId]
+      properties:
+        applicationId: { type: string, format: uuid, description: "ID of the application to link" }
+        relationship: { type: string, default: uses, enum: [uses, manages, replaces, integrates_with] }
+        notes: { type: string }
+
+    ProjectContractLink:
+      type: object
+      required: [contractId]
+      properties:
+        contractId: { type: string, format: uuid, description: "ID of the contract to link" }
+        relationship: { type: string, default: funded_by, enum: [funded_by, delivered_under, staffing, licensing, maintenance, infrastructure, consulting, other] }
+        notes: { type: string }
+
+    # ─── Velocity Schemas ───
+
+    VelocityMoveInput:
+      type: object
+      required: [status]
+      description: Make a chess-clock move — transition a velocity step to a new status.
+      properties:
+        status:
+          type: string
+          enum: [not_started, ready_to_start, ai_working, human_working, ai_review, human_review, completed, blocked, hand_raised]
+          description: |
+            Target status for this move. Must be a valid transition from the current status.
+            hand_raised = need help (yellow pulsing ring, 0 penalty). blocked = impediment (red ring, -10 pts).
+        actor:
+          type: string
+          enum: [human, ai]
+          description: Who is making this move.
+        content:
+          type: string
+          maxLength: 10000
+          description: Notes, instructions, or context for the next actor.
+        contentJson:
+          type: object
+          description: Structured metadata (optional).
+        attachments:
+          type: array
+          items:
+            type: object
+            properties:
+              filename: { type: string }
+              url: { type: string }
+              type: { type: string }
+
+    VelocityNoteInput:
+      type: object
+      required: [content]
+      description: Add a note to a velocity step without changing status.
+      properties:
+        actor:
+          type: string
+          enum: [human, ai]
+          default: human
+        content:
+          type: string
+          minLength: 1
+          maxLength: 10000
+        contentJson:
+          type: object
+        attachments:
+          type: array
+          items:
+            type: object
+            properties:
+              filename: { type: string }
+              url: { type: string }
+              type: { type: string }
+
+    ProjectVelocityOverview:
+      type: object
+      description: Velocity data for a single module (used in dashboard heatmap).
+      properties:
+        pk_project: { type: string, format: uuid }
+        project_name: { type: string }
+        pk_module: { type: string, format: uuid }
+        module_name: { type: string }
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              pk_module_velocity: { type: string, format: uuid }
+              step_name: { type: string, enum: [requirements, planning, architecture, prototyping, development, user_testing, user_acceptance, deployment] }
+              step_order: { type: integer }
+              status: { type: string, enum: [not_started, ready_to_start, ai_working, human_working, ai_review, human_review, completed, blocked] }
+              current_actor: { type: string, enum: [human, ai], nullable: true }
+              loop_count: { type: integer }
+              turn_count: { type: integer }
+              is_locked: { type: boolean }
+              requires_human_approval: { type: boolean, description: "If true, AI cannot approve this step — human sign-off required" }
+              requires_ai_recommendation: { type: boolean, description: "If true, human approval without prior AI review is flagged as misalignment" }
+              step_weight: { type: integer, enum: [1, 2, 3], description: "Complexity multiplier for scoring (1=simple, 2=standard, 3=complex)" }
+              blocked_reason: { type: string, nullable: true }
+              blocked_since: { type: string, format: date-time, nullable: true }
+        metrics:
+          type: object
+          description: Module-level metrics (included in dashboard response).
+          properties:
+            velocity_score: { type: integer, description: Net velocity score (bonus - penalty) }
+            velocity_bonus: { type: integer, description: Points earned from forward progress }
+            velocity_penalty: { type: integer, description: Points deducted from loopbacks/rejects }
+            total_turns: { type: integer }
+            loopback_count: { type: integer }
+            ai_time_seconds: { type: integer }
+            human_time_seconds: { type: integer }
+            alignment_count: { type: integer, description: Steps completed with both human and AI participation }
+            misalignment_count: { type: integer, description: Steps completed without both actors participating }
+            outcome_score: { type: integer, nullable: true, minimum: 1, maximum: 5, description: Stakeholder satisfaction rating (set at deployment) }
+
+    VelocityTurnResponse:
+      type: object
+      properties:
+        pk_velocity_turn: { type: string, format: uuid }
+        turn_actor: { type: string, enum: [human, ai] }
+        turn_action: { type: string, enum: [start, pass, review, approve, reject, complete, block, unblock, note, send_back] }
+        turn_from_status: { type: string, nullable: true }
+        turn_to_status: { type: string, nullable: true }
+        turn_content: { type: string, nullable: true }
+        turn_content_json: { type: object, nullable: true }
+        turn_attachments: { type: array, items: { type: object, properties: { filename: { type: string }, url: { type: string }, type: { type: string } } } }
+        turn_user_email: { type: string, nullable: true, description: Login email of the human who made this move }
+        turn_user_name: { type: string, nullable: true, description: Display name of the human }
+        turn_api_key_id: { type: string, format: uuid, nullable: true, description: API key ID if this move was made by an AI agent }
+        turn_is_aligned: { type: boolean, nullable: true, description: "Whether both human and AI participated before completion (null if not a completion turn)" }
+        created_at: { type: string, format: date-time }
+
+    SuccessResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data: { type: object }
+
+    PaginatedResponse:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data: { type: array, items: { type: object } }
+        pagination:
+          type: object
+          properties:
+            page: { type: integer }
+            limit: { type: integer }
+            total: { type: integer }
+            totalPages: { type: integer }
+
+    # ─── Collaboration schemas (v4.0) ───
+
+    ProjectMember:
+      type: object
+      properties:
+        pk_project_member: { type: string, format: uuid }
+        fk_pm_project:     { type: string, format: uuid }
+        fk_pm_user:        { type: string, format: uuid }
+        member_role:       { type: string, enum: [owner, collaborator] }
+        added_by:          { type: string, format: uuid, nullable: true }
+        added_at:          { type: string, format: date-time }
+        removed_at:        { type: string, format: date-time, nullable: true }
+        is_active:         { type: boolean }
+        user_email_address: { type: string, format: email }
+        user_display_name:  { type: string }
+        avatar_url:         { type: string, nullable: true }
+
+    ProjectPermissions:
+      type: object
+      description: Computed permission state for the authenticated user against a project.
+      properties:
+        projectId:   { type: string, format: uuid }
+        isOpen:      { type: boolean, description: "True when project has zero active members" }
+        isClaimed:   { type: boolean }
+        isLocked:    { type: boolean }
+        lockedBy:    { type: string, format: uuid, nullable: true }
+        isMember:    { type: boolean }
+        isOwner:     { type: boolean }
+        isAdmin:     { type: boolean }
+        cloneDisabled: { type: boolean }
+        canRead:               { type: boolean }
+        canWriteProject:       { type: boolean }
+        canMakeVelocityMoves:  { type: boolean }
+        canManageMembers:      { type: boolean }
+        canRename:             { type: boolean }
+        canToggleLock:         { type: boolean }
+        canTogglePolicy:       { type: boolean }
+        canClone:              { type: boolean }
+
+    VersionRow:
+      type: object
+      description: One project in a cluster (parent or clone), with progress + lock + owner info.
+      properties:
+        pk_project:               { type: string, format: uuid }
+        project_name:             { type: string }
+        project_code:             { type: string, nullable: true }
+        project_version_label:    { type: string, nullable: true }
+        project_status:           { type: string, nullable: true }
+        project_percent_complete: { type: integer, nullable: true }
+        project_is_locked:        { type: boolean }
+        project_locked_by:        { type: string, format: uuid, nullable: true }
+        fk_project_parent:        { type: string, format: uuid, nullable: true }
+        project_cloned_at:        { type: string, format: date-time, nullable: true }
+        project_cloned_by:        { type: string, format: uuid, nullable: true }
+        active_member_count:      { type: integer }
+        primary_owner_email:      { type: string, format: email, nullable: true }
+        primary_owner_name:       { type: string, nullable: true }
+
+    Cluster:
+      type: object
+      properties:
+        parent:   { allOf: [{ $ref: '#/components/schemas/VersionRow' }], nullable: true }
+        versions:
+          type: array
+          items: { $ref: '#/components/schemas/VersionRow' }
+
+    CloneInput:
+      type: object
+      properties:
+        versionLabel: { type: string, maxLength: 200, nullable: true }
+        copyLinks:    { type: boolean, default: true, description: "Copy project_link rows to the clone" }
+        copyBudgets:  { type: boolean, default: false, description: "Copy budget lines (resets spent to 0)" }
+
+    MemberAddInput:
+      type: object
+      required: [userId]
+      properties:
+        userId: { type: string, format: uuid }
+        role:   { type: string, enum: [owner, collaborator], default: collaborator }
+
+    MemberPatchInput:
+      type: object
+      required: [role]
+      properties:
+        role: { type: string, enum: [owner, collaborator] }
+
+    LockInput:
+      type: object
+      properties:
+        reason: { type: string, maxLength: 2000, nullable: true }
+
+    UnlockInput:
+      type: object
+      properties:
+        force: { type: boolean, default: false, description: "Admin-only — force-unlock a lock acquired by someone else" }
+
+    TransferOwnershipInput:
+      type: object
+      required: [toUserId]
+      properties:
+        toUserId: { type: string, format: uuid }
+
+    ClonePolicyInput:
+      type: object
+      required: [disabled]
+      properties:
+        disabled: { type: boolean }
+        reason:   { type: string, maxLength: 2000, nullable: true }
+
+    RenameVersionInput:
+      type: object
+      properties:
+        label: { type: string, maxLength: 200, nullable: true }
+
+    UserLookupResult:
+      type: object
+      properties:
+        pk_user_account:   { type: string, format: uuid }
+        user_email_address: { type: string, format: email }
+        user_display_name:  { type: string }
+        avatar_url:         { type: string, nullable: true }
+
+paths:
+  # ═══ Auth ═══
+  /auth/google:
+    get: { tags: [Auth], summary: Initiate Google SSO login, security: [] }
+  /auth/google/callback:
+    get: { tags: [Authentication], summary: Google OAuth2 callback (internal), security: [] }
+  /auth/microsoft:
+    get: { tags: [Authentication], summary: Initiate Microsoft SSO login, security: [] }
+  /auth/microsoft/callback:
+    get: { tags: [Authentication], summary: Microsoft OIDC callback (internal), security: [] }
+  /auth/csrf:
+    get:
+      tags: [Auth]
+      summary: Get CSRF token (for cookie-based auth only)
+      security: []
+      responses:
+        200:
+          description: CSRF token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { type: object, properties: { csrfToken: { type: string } } }
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Get current user profile
+      responses:
+        200:
+          description: User profile
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      email: { type: string }
+                      displayName: { type: string }
+                      role: { type: string }
+                      avatarUrl: { type: string, nullable: true }
+  /auth/refresh:
+    post: { tags: [Auth], summary: Refresh access token (cookie-based) }
+  /auth/logout:
+    post: { tags: [Auth], summary: Logout and revoke refresh token }
+
+  # ═══ Projects ═══
+  /projects:
+    get:
+      tags: [Projects]
+      summary: List projects (paginated, filterable)
+      security: []
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 500 } }
+        - { name: search, in: query, schema: { type: string }, description: "Search name, description, demand number" }
+        - { name: ministry, in: query, schema: { type: string }, description: "Filter by ministry code (e.g. TI)" }
+        - { name: status, in: query, schema: { type: string, enum: [discovery, requirements, development, testing, client_review, client_acceptance, completion, on_hold, cancelled] } }
+        - { name: sort, in: query, schema: { type: string, enum: [name, end_date, percent_complete, ministry, created_at], default: created_at } }
+        - { name: order, in: query, schema: { type: string, enum: [asc, desc], default: desc } }
+        - { name: missionCritical, in: query, schema: { type: boolean }, description: "Filter by mission-critical flag" }
+      responses:
+        200: { description: Paginated project list, content: { application/json: { schema: { $ref: '#/components/schemas/PaginatedResponse' } } } }
+    post:
+      tags: [Projects]
+      summary: Create project (auto-provisions SharePoint folders)
+      description: |
+        Creates a project record. **Side-effect (v5.1):** SharePoint folder
+        hierarchy (`/Velo Projects/{ProjectName} (last4)/`, `/Audits/`,
+        `/Requirements/`) is auto-provisioned in the background — the response
+        does not wait for it. A `sharepoint_folders_created` SSE event is
+        broadcast when the folders land (with `autoProvisioned: true`). If
+        SharePoint is unconfigured or unreachable, the auto-provision fails
+        silently (warn-logged) and project creation still succeeds.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectInput' } } } }
+      responses:
+        201: { description: Project created, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessResponse' } } } }
+
+  /projects/{id}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Projects]
+      summary: Get project with all sub-resources (modules, budgets, links, leads)
+      security: []
+      responses:
+        200: { description: Full project detail }
+    put:
+      tags: [Projects]
+      summary: Update project (all fields optional for partial update)
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/ProjectInput' } } } }
+    delete:
+      tags: [Projects]
+      summary: Soft-delete project (recoverable by admin)
+
+  /projects/{id}/merge:
+    post:
+      tags: [Projects]
+      summary: Merge another project into this one (transfers all sub-resources, soft-deletes victim)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid }, description: "Survivor project ID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mergeProjectId]
+              properties:
+                mergeProjectId: { type: string, format: uuid, description: "Project to merge in and delete" }
+
+  # ═══ Modules ═══
+  /projects/{id}/modules:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get: { tags: [Modules], summary: List modules, security: [] }
+    post:
+      tags: [Modules]
+      summary: Create module (auto-extends SharePoint folder hierarchy)
+      description: |
+        Creates a module. A DB trigger inserts the 8 `module_velocity` rows automatically.
+        **Side-effect (v5.1):** the SharePoint folder hierarchy for the parent project is
+        re-ensured (idempotent), so the new module's folder + 8 step subfolders are added
+        without requiring a manual "Create Folders" click. Fire-and-forget — failures are
+        logged, never block the module create response.
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ModuleInput' } } } }
+      responses: { 201: { description: Module created } }
+
+  /projects/{id}/modules/{moduleId}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: moduleId, in: path, required: true, schema: { type: string, format: uuid } }
+    put:
+      tags: [Modules]
+      summary: Update module
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/ModuleInput' } } } }
+    delete: { tags: [Modules], summary: Soft-delete module }
+
+  /projects/{id}/modules/{moduleId}/links:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: moduleId, in: path, required: true, schema: { type: string, format: uuid } }
+    get: { tags: [Module Links], summary: List module links, security: [] }
+    post:
+      tags: [Module Links]
+      summary: Add link to module
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/LinkInput' } } } }
+
+  /projects/{id}/modules/{moduleId}/links/{linkId}:
+    delete:
+      tags: [Module Links]
+      summary: Remove module link
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: moduleId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: linkId, in: path, required: true, schema: { type: string, format: uuid } }
+
+  # ═══ Budgets ═══
+  /projects/{id}/budgets:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get: { tags: [Budgets], summary: List budget lines, security: [] }
+    post:
+      tags: [Budgets]
+      summary: Add budget line
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/BudgetInput' } } } }
+      responses: { 201: { description: Budget created } }
+
+  /projects/{id}/budgets/{budgetId}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: budgetId, in: path, required: true, schema: { type: string, format: uuid } }
+    put:
+      tags: [Budgets]
+      summary: Update budget line
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/BudgetInput' } } } }
+    delete: { tags: [Budgets], summary: Delete budget line }
+
+  # ═══ Project Links ═══
+  /projects/{id}/links:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get: { tags: [Project Links], summary: List external links, security: [] }
+    post:
+      tags: [Project Links]
+      summary: Add external link
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/LinkInput' } } } }
+
+  /projects/{id}/links/{linkId}:
+    delete:
+      tags: [Project Links]
+      summary: Remove link
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: linkId, in: path, required: true, schema: { type: string, format: uuid } }
+
+  # ═══ Updates ═══
+  /projects/{id}/updates:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      tags: [Updates]
+      summary: List status updates
+      security: []
+      parameters:
+        - { name: type, in: query, schema: { type: string, enum: [progress, blocker, plan, risk, decision, milestone, ai_summary, audit_result] } }
+    post:
+      tags: [Updates]
+      summary: Post status update
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/UpdateInput' } } } }
+
+  /projects/{id}/updates/{updateId}:
+    delete:
+      tags: [Updates]
+      summary: Delete update (recorded in immutable audit log)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: updateId, in: path, required: true, schema: { type: string, format: uuid } }
+
+  # ═══ Team / Leads ═══
+  /projects/{id}/leads:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get: { tags: [Team], summary: List team members with roles, security: [] }
+    post:
+      tags: [Team]
+      summary: Add team member
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/LeadInput' } } } }
+
+  /projects/{id}/leads/{leadId}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: leadId, in: path, required: true, schema: { type: string, format: uuid } }
+    put:
+      tags: [Team]
+      summary: Update team member role/status
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/LeadInput' } } } }
+    delete: { tags: [Team], summary: Remove team member }
+
+  # ═══ Audit Log ═══
+  /projects/{id}/audit:
+    get:
+      tags: [Audit]
+      summary: Paginated audit log for project and all sub-resources (immutable — no DELETE endpoint)
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 30, maximum: 100 } }
+      responses:
+        200:
+          description: Paginated audit entries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      data:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            pk_audit_log: { type: string, format: uuid }
+                            audit_action: { type: string, enum: [INSERT, UPDATE, DELETE] }
+                            audit_table_name: { type: string }
+                            audit_record_id: { type: string, format: uuid }
+                            audit_new_data: { type: object, nullable: true, description: "Includes _authSource (session|api_key) and _apiKeyId" }
+                            audit_old_data: { type: object, nullable: true }
+                            user_display_name: { type: string }
+                            created_at: { type: string, format: date-time }
+                      pagination: { $ref: '#/components/schemas/PaginatedResponse/properties/pagination' }
+
+  # ═══ Ministries ═══
+  /ministries:
+    get:
+      tags: [Ministries]
+      summary: List all ministries with project counts
+      security: []
+      responses:
+        200:
+          description: Ministry list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        ministry_code: { type: string, example: "TI" }
+                        ministry_name: { type: string, example: "Department of Technology" }
+                        project_count: { type: integer }
+
+  /ministries/{code}:
+    get:
+      tags: [Ministries]
+      summary: Get ministry by code with its projects
+      security: []
+      parameters: [{ name: code, in: path, required: true, schema: { type: string }, example: "TI" }]
+
+  # ═══ People ═══
+  /persons:
+    get:
+      tags: [People]
+      summary: List people (paginated, filterable)
+      security: []
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: search, in: query, schema: { type: string } }
+        - { name: type, in: query, schema: { type: string, enum: [fte, contractor] }, description: "Filter by employment type" }
+    post:
+      tags: [People]
+      summary: Create person
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/PersonInput' } } } }
+
+  /persons/search:
+    get:
+      tags: [People]
+      summary: Typeahead fuzzy search (returns top 20 matches)
+      security: []
+      parameters: [{ name: q, in: query, required: true, schema: { type: string, minLength: 1 } }]
+
+  /persons/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get: { tags: [People], summary: Get person with all project assignments, security: [] }
+    put:
+      tags: [People]
+      summary: Update person (cascades name changes to all project assignments)
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/PersonInput' } } } }
+    delete: { tags: [People], summary: Delete person and remove from all projects }
+
+  /persons/{id}/merge:
+    post:
+      tags: [People]
+      summary: Merge duplicate person (transfers assignments, deletes duplicate)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid }, description: "Survivor person ID" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mergePersonId]
+              properties:
+                mergePersonId: { type: string, format: uuid }
+
+  # ═══ Canvas & Dependencies ═══
+  /canvas:
+    get:
+      tags: [Canvas]
+      summary: Get all projects, modules, and dependencies for canvas rendering
+      security: []
+      responses:
+        200:
+          description: Canvas data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      projects: { type: array, items: { type: object } }
+                      modules: { type: array, items: { type: object } }
+                      dependencies: { type: array, items: { type: object } }
+
+  /canvas/positions:
+    post:
+      tags: [Canvas]
+      summary: Batch save drag positions for projects and modules
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                projects: { type: array, items: { type: object, properties: { id: { type: string, format: uuid }, x: { type: number }, y: { type: number } } } }
+                modules: { type: array, items: { type: object, properties: { id: { type: string, format: uuid }, x: { type: number }, y: { type: number } } } }
+
+  /canvas/reset:
+    post: { tags: [Canvas], summary: Reset all canvas positions to auto-layout }
+
+  /canvas/dependencies:
+    get: { tags: [Canvas], summary: List all project-to-project dependencies, security: [] }
+    post:
+      tags: [Canvas]
+      summary: Create or update project dependency
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/DependencyInput' } } } }
+
+  /canvas/dependencies/{id}:
+    delete:
+      tags: [Canvas]
+      summary: Remove dependency
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+
+  # ═══ API Keys ═══
+  /api-keys:
+    get:
+      tags: [API Keys]
+      summary: List your API keys (masked — prefix only)
+      responses:
+        200:
+          description: API key list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        name: { type: string }
+                        prefix: { type: string, example: "velo_4c4" }
+                        scopes: { type: array, items: { type: string } }
+                        createdAt: { type: string, format: date-time }
+                        lastUsedAt: { type: string, format: date-time, nullable: true }
+    post:
+      tags: [API Keys]
+      summary: Generate new API key (full key returned ONCE — copy immediately)
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApiKeyInput' } } } }
+      responses:
+        201:
+          description: API key created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      id: { type: string, format: uuid }
+                      name: { type: string }
+                      key: { type: string, description: "Full key — shown ONCE. Use as X-API-Key header value." }
+                      prefix: { type: string }
+                  message: { type: string }
+
+  /api-keys/{id}:
+    delete:
+      tags: [API Keys]
+      summary: Revoke API key (immediate, irreversible)
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+
+  # ═══ Applications (project_lead + admin only) ═══
+  /applications:
+    get:
+      tags: [Applications]
+      summary: List applications (paginated, filterable) — requires project_lead or admin role
+      description: Access restricted to project_lead and admin roles. Returns 403 for user and runner roles.
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 200 } }
+        - { name: search, in: query, schema: { type: string }, description: "Search name, application ID, owner" }
+        - { name: status, in: query, schema: { type: string, enum: [active, decommissioned, in_development, on_hold] } }
+        - { name: sort, in: query, schema: { type: string, enum: [name, application_id, owner, created_at], default: created_at } }
+        - { name: order, in: query, schema: { type: string, enum: [asc, desc], default: desc } }
+      responses:
+        200: { description: Paginated application list, content: { application/json: { schema: { $ref: '#/components/schemas/PaginatedResponse' } } } }
+    post:
+      tags: [Applications]
+      summary: Create application
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ApplicationInput' } } } }
+      responses:
+        201: { description: Application created, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessResponse' } } } }
+
+  /applications/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      tags: [Applications]
+      summary: Get application by ID
+      security: []
+      responses:
+        200: { description: Application detail, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessResponse' } } } }
+    put:
+      tags: [Applications]
+      summary: Update application
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/ApplicationInput' } } } }
+    delete:
+      tags: [Applications]
+      summary: Soft-delete application
+
+  # ═══ Contracts (project_lead + admin only) ═══
+  /contracts:
+    get:
+      tags: [Contracts]
+      summary: List contracts (paginated, filterable) — requires project_lead or admin role
+      description: Access restricted to project_lead and admin roles. Returns 403 for user and runner roles.
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 20, maximum: 200 } }
+        - { name: search, in: query, schema: { type: string }, description: "Search contract number, vendor name" }
+        - { name: status, in: query, schema: { type: string, enum: [active, expired, terminated, pending] } }
+        - { name: sort, in: query, schema: { type: string, enum: [vendor_name, contract_number, end_date, value, created_at], default: created_at } }
+        - { name: order, in: query, schema: { type: string, enum: [asc, desc], default: desc } }
+      responses:
+        200: { description: Paginated contract list, content: { application/json: { schema: { $ref: '#/components/schemas/PaginatedResponse' } } } }
+    post:
+      tags: [Contracts]
+      summary: Create contract
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ContractInput' } } } }
+      responses:
+        201: { description: Contract created, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessResponse' } } } }
+
+  /contracts/{id}:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get:
+      tags: [Contracts]
+      summary: Get contract by ID
+      security: []
+      responses:
+        200: { description: Contract detail, content: { application/json: { schema: { $ref: '#/components/schemas/SuccessResponse' } } } }
+    put:
+      tags: [Contracts]
+      summary: Update contract
+      requestBody: { content: { application/json: { schema: { $ref: '#/components/schemas/ContractInput' } } } }
+    delete:
+      tags: [Contracts]
+      summary: Soft-delete contract
+
+  # ═══ Project ↔ Application Links ═══
+  /projects/{id}/applications:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get: { tags: [Project Applications], summary: List linked applications, security: [] }
+    post:
+      tags: [Project Applications]
+      summary: Link application to project
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectApplicationLink' } } } }
+      responses: { 201: { description: Application linked } }
+
+  /projects/{id}/applications/{linkId}:
+    delete:
+      tags: [Project Applications]
+      summary: Unlink application from project
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: linkId, in: path, required: true, schema: { type: string, format: uuid } }
+
+  # ═══ Project ↔ Contract Links ═══
+  /projects/{id}/contracts:
+    parameters: [{ name: id, in: path, required: true, schema: { type: string, format: uuid } }]
+    get: { tags: [Project Contracts], summary: List linked contracts, security: [] }
+    post:
+      tags: [Project Contracts]
+      summary: Link contract to project
+      requestBody: { required: true, content: { application/json: { schema: { $ref: '#/components/schemas/ProjectContractLink' } } } }
+      responses: { 201: { description: Contract linked } }
+
+  /projects/{id}/contracts/{linkId}:
+    delete:
+      tags: [Project Contracts]
+      summary: Unlink contract from project
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: linkId, in: path, required: true, schema: { type: string, format: uuid } }
+
+  # ═══ Services ═══
+  /services/categories:
+    get:
+      tags: [Services]
+      summary: List service categories
+      security: []
+      responses:
+        200:
+          description: Service category list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string, format: uuid }
+                        name: { type: string }
+                        description: { type: string, nullable: true }
+
+  # ═══ Project Collaboration (v4.0) ═══
+
+  /projects/{id}/clone:
+    post:
+      tags: [Collaboration]
+      summary: Clone a top-level project (single-level, runner+ role)
+      description: |
+        Creates a new project record with `fk_project_parent` set to the source.
+        Copies modules + project links (and optionally budgets). Resets velocity state,
+        members, audits, dates, percent_complete, and challenge claim fields.
+        The cloner becomes the sole owner of the clone.
+
+        **Side-effect (v5.1):** SharePoint folder hierarchy is auto-provisioned
+        for the new clone (project root + Audits + Requirements + per-module
+        + per-velocity-step folders). Fire-and-forget; broadcasts
+        `sharepoint_folders_created` SSE event with `autoProvisioned: true`.
+
+        Errors:
+        - `403 CLONE_DISABLED` — admin disabled cloning of this project
+        - `422 CLONE_OF_CLONE` — source already has a parent (no clones-of-clones)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: Idempotency-Key, in: header, required: false, schema: { type: string, format: uuid } }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CloneInput' }
+      responses:
+        '201':
+          description: Clone created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      pk_project:   { type: string, format: uuid }
+                      project_name: { type: string }
+                      project_code: { type: string, nullable: true, description: "Auto-suffixed `<parent>-vN`" }
+        '403': { description: CLONE_DISABLED }
+        '422': { description: CLONE_OF_CLONE }
+
+  /projects/{id}/cluster:
+    get:
+      tags: [Collaboration]
+      summary: Get the version cluster (parent + all clones)
+      description: |
+        Returns the parent project plus every clone of it (single-level lineage).
+        If `id` is a clone, walks up to its parent first. Each entry includes lock state,
+        progress, and primary owner.
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Cluster
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/Cluster' }
+
+  /projects/{id}/versions:
+    get:
+      tags: [Collaboration]
+      summary: Flat list of versions in the cluster
+      description: Same data as /cluster but flat — useful for UI lists.
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Array of VersionRow
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/VersionRow' }
+
+  /projects/{id}/version-label:
+    put:
+      tags: [Collaboration]
+      summary: Rename a clone's version label (owner-only)
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: If-Match, in: header, required: false, schema: { type: integer }, description: project_revision }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RenameVersionInput' }
+      responses:
+        '200': { description: Updated label }
+        '403': { description: OWNER_REQUIRED }
+        '412': { description: PRECONDITION_FAILED — stale revision }
+
+  /projects/{id}/lock:
+    post:
+      tags: [Collaboration]
+      summary: Acquire an exclusive lock on the project (owner-only)
+      description: |
+        While locked, only the locker (and admins) may mutate this project.
+        Lock-acquire is idempotent if already held by the same user (reason updates if provided).
+        If held by another user, returns `409 ALREADY_LOCKED`.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: If-Match, in: header, required: false, schema: { type: integer } }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LockInput' }
+      responses:
+        '200':
+          description: Lock acquired or already held by self
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      project_is_locked:   { type: boolean }
+                      project_locked_by:   { type: string, format: uuid }
+                      project_locked_at:   { type: string, format: date-time }
+                      project_lock_reason: { type: string, nullable: true }
+        '409': { description: ALREADY_LOCKED }
+        '423': { description: PROJECT_LOCKED — held by another user (when called as a write gate elsewhere) }
+
+  /projects/{id}/unlock:
+    post:
+      tags: [Collaboration]
+      summary: Release lock — own lock or admin force
+      description: |
+        Owners may release their own lock. Admins may pass `force=true` to release a lock held by
+        another user; doing so writes a `project_update` of type `decision` for visibility.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UnlockInput' }
+      responses:
+        '204': { description: Lock released }
+        '403': { description: LOCK_OWNED_BY_OTHER — force=true required }
+
+  /projects/{id}/members:
+    get:
+      tags: [Collaboration]
+      summary: List active members
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Members
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/ProjectMember' }
+    post:
+      tags: [Collaboration]
+      summary: Add a member (owner-only, or self-add to an open project)
+      description: |
+        Owners may add other users with any role. On an open project (no active members),
+        the requesting user may self-add as owner — this is the **direct-claim** path.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MemberAddInput' }
+      responses:
+        '201': { description: Membership created }
+        '403': { description: OWNER_REQUIRED }
+        '409': { description: User is already an active member }
+
+  /projects/{id}/members/history:
+    get:
+      tags: [Collaboration]
+      summary: List all members including historical (removed) memberships
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Active + removed members ordered by added_at }
+
+  /projects/{id}/members/{membershipId}:
+    parameters:
+      - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: membershipId, in: path, required: true, schema: { type: string, format: uuid } }
+    patch:
+      tags: [Collaboration]
+      summary: Change a member's role (owner-only)
+      description: |
+        Demoting the last owner returns `409 LAST_OWNER`. Use transfer-ownership to swap atomically.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MemberPatchInput' }
+      responses:
+        '200': { description: Updated membership }
+        '409': { description: LAST_OWNER }
+    delete:
+      tags: [Collaboration]
+      summary: Remove a member (owner-only, or self-removal)
+      description: |
+        Owners may remove anyone. Anyone may remove themselves. Removing the last owner is allowed only
+        when no collaborators remain (project becomes open). Otherwise returns `409 LAST_OWNER`.
+      responses:
+        '204': { description: Membership deactivated (kept in history) }
+        '409': { description: LAST_OWNER }
+
+  /projects/{id}/transfer-ownership:
+    post:
+      tags: [Collaboration]
+      summary: Transfer ownership to another existing member (owner-only)
+      description: |
+        Atomically promotes the target to owner and demotes the requester to collaborator.
+        Target must already be a member — add them first if not.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferOwnershipInput' }
+      responses:
+        '204': { description: Ownership transferred }
+        '404': { description: Target is not a member }
+        '409': { description: Target is already an owner }
+
+  /projects/{id}/clone-policy:
+    patch:
+      tags: [Collaboration]
+      summary: Enable/disable cloning of a project (admin-only)
+      description: |
+        Admins set `disabled=true` to block clone attempts on this project (returns 403 CLONE_DISABLED to
+        future cloners, including admins). Existing clones are unaffected. Set `disabled=false` to re-enable.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ClonePolicyInput' }
+      responses:
+        '200':
+          description: Updated policy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      project_clone_disabled:        { type: boolean }
+                      project_clone_disabled_by:     { type: string, format: uuid, nullable: true }
+                      project_clone_disabled_at:     { type: string, format: date-time, nullable: true }
+                      project_clone_disabled_reason: { type: string, nullable: true }
+
+  /projects/{id}/permissions:
+    get:
+      tags: [Collaboration]
+      summary: Compute permission state for the authenticated user against this project
+      description: |
+        Single endpoint that returns every gate the UI needs to render correctly: open vs claimed,
+        locked, member status, owner status, admin, clone-policy, and derived `canX` booleans.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Permission state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data: { $ref: '#/components/schemas/ProjectPermissions' }
+
+  /users/lookup:
+    get:
+      tags: [User Management]
+      summary: Find users by partial email or display name (any authenticated user)
+      description: |
+        Used by the membership UI so non-admins can search teammates by email/name to add as members.
+        Returns minimal info — does not expose roles or activity. Requires query length ≥ 2.
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 2 } }
+        - { name: limit, in: query, schema: { type: integer, default: 10, maximum: 25 } }
+      responses:
+        '200':
+          description: Up to `limit` matches
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/UserLookupResult' }
+
+  # ═══ Velocity (Human-AI Collaboration State Machine) ═══
+
+  /velocity/stream:
+    get:
+      tags: [Velocity]
+      summary: SSE stream — real-time board updates for multiplayer sync
+      description: |
+        Server-Sent Events stream that broadcasts all velocity board changes to connected clients.
+        Events:
+        Velocity board — `connected`, `clients`, `move`, `note`, `send_back`, `lock`.
+        Project lifecycle — `project_created`, `project_updated`, `project_deleted`.
+        Module lifecycle — `module_created`, `module_updated`, `module_deleted`.
+        Collaboration (v5.0) — `member_added`, `member_removed`, `member_role_changed`,
+        `ownership_transferred`, `version_created`, `version_renamed`, `lock_acquired`,
+        `lock_released`, `clone_policy_changed`.
+        SharePoint — `sharepoint_folders_created` (`autoProvisioned: true` when fired
+        by auto-provision), `sharepoint_file_uploaded`, `sharepoint_file_updated`,
+        `sharepoint_file_deleted`,
+        `sharepoint_folder_deleted`, `sharepoint_subfolder_created`,
+        `sharepoint_item_renamed`, `sharepoint_item_moved`,
+        `sharepoint_ai_job_started`, `sharepoint_ai_job_failed`,
+        `sharepoint_ai_processing_all`, `sharepoint_ai_shadow_created`,
+        `sharepoint_ai_skipped`, `sharepoint_ai_sub_progress`.
+        Challenges (v5.1) — `challenge_accepted`, `challenge_closed`, `challenge_winner_picked`,
+        `challenge_claimed` / `challenge_completed` / `challenge_unclaimed` (legacy single-claimer flow).
+        Used by the Velocity UI to update the heatmap in real-time without polling.
+        Multiple humans and AI agents can watch the same board simultaneously.
+        Heartbeat sent every 30s to keep connection alive.
+      security: []
+      responses:
+        '200':
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+              examples:
+                connected_event:
+                  summary: Initial connection with current client count
+                  value: "event: connected\ndata: {\"clients\":3}\n\n"
+                clients_event:
+                  summary: Client count updated (someone joined/left)
+                  value: "event: clients\ndata: {\"count\":4}\n\n"
+                move_event:
+                  summary: A step status change (includes hand_raised, blocked)
+                  value: "event: move\ndata: {\"moduleId\":\"abc\",\"stepName\":\"architecture\",\"fromStatus\":\"ai_working\",\"toStatus\":\"human_review\",\"actor\":\"ai\",\"action\":\"review\"}\n\n"
+                note_event:
+                  summary: A note was added
+                  value: "event: note\ndata: {\"moduleId\":\"abc\",\"stepName\":\"architecture\",\"turn\":{...}}\n\n"
+                send_back_event:
+                  summary: Module sent back to earlier step
+                  value: "event: send_back\ndata: {\"moduleId\":\"abc\",\"targetStepName\":\"requirements\",\"actor\":\"human\"}\n\n"
+                lock_event:
+                  summary: Step lock toggled
+                  value: "event: lock\ndata: {\"moduleId\":\"abc\",\"stepName\":\"architecture\",\"locked\":true}\n\n"
+                project_created_event:
+                  summary: New project created
+                  value: "event: project_created\ndata: {\"projectId\":\"abc\",\"projectName\":\"My Project\"}\n\n"
+                module_created_event:
+                  summary: New module added to a project
+                  value: "event: module_created\ndata: {\"projectId\":\"abc\",\"moduleId\":\"def\",\"moduleName\":\"Phase 1\"}\n\n"
+
+  /velocity:
+    get:
+      tags: [Velocity]
+      summary: Dashboard — velocity overview across all projects
+      description: Returns all projects with their modules and velocity step statuses for heatmap rendering.
+      security: []
+      responses:
+        '200':
+          description: Velocity dashboard data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ProjectVelocityOverview'
+
+  /velocity/projects/{projectId}:
+    get:
+      tags: [Velocity]
+      summary: Get velocity overview for a project
+      description: Returns all modules in the project with their 8 velocity step statuses.
+      security: []
+      parameters:
+        - { name: projectId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Project velocity data
+
+  /velocity/modules/{moduleId}:
+    get:
+      tags: [Velocity]
+      summary: Get all 8 velocity steps for a module
+      security: []
+      parameters:
+        - { name: moduleId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Module velocity steps
+
+  /velocity/modules/{moduleId}/steps/{stepName}:
+    put:
+      tags: [Velocity]
+      summary: Make a move — update step status (chess clock)
+      description: |
+        Validates the state transition, updates the step status, records a turn in history,
+        and auto-advances the next step if the current one is completed.
+        Increments loop_count when a review rejects back to working status.
+
+        **Membership gate:** claimed project (≥1 member) → must be a member
+        or `403 NOT_A_MEMBER`. Open project → any runner+. Same gate on
+        add-note, lock, and send-back. **Admin does not bypass** — admins
+        must add themselves as a member to play.
+      parameters:
+        - { name: moduleId, in: path, required: true, schema: { type: string, format: uuid } }
+        - name: stepName
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [requirements, planning, architecture, prototyping, development, user_testing, user_acceptance, deployment]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VelocityMoveInput'
+            examples:
+              ai_starts_work:
+                summary: AI picks up a step
+                value: { status: ai_working, actor: ai, content: "Starting architecture review based on requirements doc." }
+              human_reviews:
+                summary: Human reviews AI work
+                value: { status: human_review, actor: human, content: "Reviewing the architecture diagram and API design." }
+              approve_and_advance:
+                summary: Approve and advance to next step
+                value: { status: completed, actor: human, content: "Architecture approved. Ready for prototyping." }
+              reject_back:
+                summary: Reject back to AI for rework
+                value: { status: ai_working, actor: human, content: "Security review identified gaps in the auth flow. Please revise section 3." }
+      responses:
+        '200':
+          description: Updated step with new turn record
+        '400':
+          description: Invalid state transition
+        '404':
+          description: Module or step not found
+
+  /velocity/modules/{moduleId}/steps/{stepName}/turns:
+    get:
+      tags: [Velocity]
+      summary: Get turn history for a step
+      description: Paginated list of all chess-clock moves for a specific module step.
+      security: []
+      parameters:
+        - { name: moduleId, in: path, required: true, schema: { type: string, format: uuid } }
+        - name: stepName
+          in: path
+          required: true
+          schema: { type: string, enum: [requirements, planning, architecture, prototyping, development, user_testing, user_acceptance, deployment] }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 20 } }
+      responses:
+        '200':
+          description: Paginated turn history
+    post:
+      tags: [Velocity]
+      summary: Add a note to a step without changing status
+      description: Leave instructions, attach files, or add context for the next actor.
+      parameters:
+        - { name: moduleId, in: path, required: true, schema: { type: string, format: uuid } }
+        - name: stepName
+          in: path
+          required: true
+          schema: { type: string, enum: [requirements, planning, architecture, prototyping, development, user_testing, user_acceptance, deployment] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VelocityNoteInput'
+            examples:
+              ai_note:
+                summary: AI leaves a note
+                value: { actor: ai, content: "Generated initial API schema. See attached openapi.yaml.", attachments: [{ filename: "openapi.yaml", url: "/files/abc123", type: "application/yaml" }] }
+      responses:
+        '201':
+          description: Note added
+
+  /velocity/modules/{moduleId}/turns:
+    get:
+      tags: [Velocity]
+      summary: Get all turns for a module across all steps
+      security: []
+      parameters:
+        - { name: moduleId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 50 } }
+      responses:
+        '200':
+          description: Paginated turn history across all steps
+
+  /velocity/modules/{moduleId}/send-back:
+    post:
+      tags: [Velocity]
+      summary: Send module back to an earlier step
+      description: |
+        Resets the target step to ready_to_start and all steps after it to not_started.
+        Increments the module-level loopback counter. Used when later steps (like User Testing)
+        discover issues that require returning to an earlier phase (like Requirements).
+      parameters:
+        - { name: moduleId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [targetStep]
+              properties:
+                targetStep:
+                  type: string
+                  enum: [requirements, planning, architecture, prototyping, development, user_testing, user_acceptance, deployment]
+                  description: The step to return to. Must be earlier than the current active step.
+                content: { type: string, description: Reason for sending back }
+                actor: { type: string, enum: [human, ai], default: human }
+            examples:
+              testing_finds_issue:
+                summary: User testing sends back to requirements
+                value: { targetStep: requirements, content: "User testing revealed missing accessibility requirements. Need to revisit req spec.", actor: human }
+      responses:
+        '200': { description: Module sent back successfully }
+        '400': { description: Target step must be earlier than current active step }
+
+  /velocity/modules/{moduleId}/steps/{stepName}/lock:
+    put:
+      tags: [Velocity]
+      summary: Lock or unlock a step
+      description: |
+        Locking a step prevents it from being reset during a send-back operation.
+        Use this to protect completed work that should not be undone.
+      parameters:
+        - { name: moduleId, in: path, required: true, schema: { type: string, format: uuid } }
+        - name: stepName
+          in: path
+          required: true
+          schema: { type: string, enum: [requirements, planning, architecture, prototyping, development, user_testing, user_acceptance, deployment] }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [locked]
+              properties:
+                locked: { type: boolean }
+            examples:
+              lock: { summary: Lock a step, value: { locked: true } }
+              unlock: { summary: Unlock a step, value: { locked: false } }
+      responses:
+        '200': { description: Step lock state updated }
+
+  /velocity/guide:
+    get:
+      tags: [Velocity]
+      summary: Download gameplay guide as Markdown file
+      security: []
+      responses:
+        '200':
+          description: Markdown file with complete Velocity gameplay guide and API reference
+
+  /velocity/claude-md:
+    get:
+      tags: [Velocity]
+      summary: Download CLAUDE.md — agent instruction file
+      description: |
+        Returns the same agent-facing instructions document referenced by AI
+        agents and provided to Claude/Anthropic when bootstrapping an agent
+        with a Velo API key. Useful for verifying that the version an agent is
+        configured with matches the live Velo deployment.
+      security: []
+      responses:
+        '200':
+          description: Markdown file with full agent workflow + endpoint reference
+
+  # ═══ Git Integration ═══
+
+  /git/repos:
+    post:
+      tags: [Git]
+      summary: Create a GitHub repository
+      description: |
+        Creates a new GitHub repo. If `org` is provided, creates under that organization.
+        Otherwise creates under the authenticated user's account.
+        GitHub PAT is injected automatically from the user's saved Settings — never pass it in the request.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, description: 'Repository name (convention: VELO-{ProjectName}-{last4uuid})' }
+                description: { type: string }
+                isPrivate: { type: boolean, default: true }
+                org: { type: string, description: 'GitHub org. Optional — if omitted, auto-injected from user Settings (parsed from GitHub URL).' }
+      responses:
+        '201':
+          description: Repository created
+
+  /git/extract:
+    post:
+      tags: [Git]
+      summary: Trigger GitHub repository extraction
+      description: |
+        Extracts commits, PRs, branches, and contributor analytics from a GitHub repository.
+        Uses the authenticated user's PAT if available, otherwise falls back to the system-level GITHUB_PAT.
+        Results are stored as a project audit.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repoUrl]
+              properties:
+                repoUrl: { type: string, format: uri, description: "GitHub repo URL (e.g. https://github.com/owner/repo)" }
+                branch: { type: string, description: "Branch to analyze (default: main)" }
+                maxCommits: { type: integer, default: 2000 }
+                since: { type: string, format: date, description: "Only include commits after this date (YYYY-MM-DD)" }
+            examples:
+              basic: { summary: Basic extraction, value: { repoUrl: "https://github.com/example-org/my-app" } }
+              detailed: { summary: With options, value: { repoUrl: "https://github.com/example-org/my-app", branch: "dev", maxCommits: 5000, since: "2025-01-01" } }
+      responses:
+        '200':
+          description: Extraction results with contributor analytics
+        '401':
+          description: No GitHub PAT available
+
+  /git/repos/{owner}/{repo}/analytics:
+    get:
+      tags: [Git]
+      summary: Get cached analytics for a repository
+      security: []
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string } }
+        - { name: repo, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Full repository analytics (commits, PRs, contributors, scores)
+
+  /git/repos/{owner}/{repo}/files:
+    get:
+      tags: [Git]
+      summary: List files in a repository directory
+      description: Requires PAT with repo read access. Proxies the GitHub Contents API.
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string } }
+        - { name: repo, in: path, required: true, schema: { type: string } }
+        - { name: path, in: query, schema: { type: string, default: '' } }
+        - { name: branch, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: Array of file/directory entries
+
+  /git/repos/{owner}/{repo}/commits/batch:
+    post:
+      tags: [Git]
+      summary: Batch commit — push multiple files in a single commit (PREFERRED)
+      description: |
+        Uses the Git Trees API to commit all files atomically in one commit.
+        This is the preferred approach for project scaffolds, bulk changes, or any multi-file push.
+        Supports any branch (main, dev, feature/*, etc). PAT injected automatically.
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string } }
+        - { name: repo, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [branch, message, files]
+              properties:
+                branch: { type: string, description: 'Target branch (main, dev, feature/xyz, etc)' }
+                message: { type: string, description: 'Commit message' }
+                files:
+                  type: array
+                  items:
+                    type: object
+                    required: [path, content]
+                    properties:
+                      path: { type: string, description: 'File path relative to repo root (e.g. src/index.ts)' }
+                      content: { type: string, description: 'File content as UTF-8 string' }
+            examples:
+              scaffold:
+                summary: Push a project scaffold
+                value:
+                  branch: main
+                  message: "feat: initial project scaffold"
+                  files:
+                    - { path: "package.json", content: "{\"name\": \"my-app\"}" }
+                    - { path: "src/index.ts", content: "console.log('hello')" }
+                    - { path: "README.md", content: "# My App" }
+      responses:
+        '201':
+          description: All files committed in a single commit
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      sha: { type: string, description: 'Commit SHA' }
+                      url: { type: string, description: 'Commit URL on GitHub' }
+                      filesCommitted: { type: integer }
+
+  /git/repos/{owner}/{repo}/commits:
+    post:
+      tags: [Git]
+      summary: Commit a single file (use /commits/batch for multi-file)
+      description: Creates or updates one file. For multi-file pushes, use /commits/batch instead. PAT injected automatically.
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string } }
+        - { name: repo, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [branch, path, content, message]
+              properties:
+                branch: { type: string }
+                path: { type: string }
+                content: { type: string, description: File content (will be base64 encoded) }
+                message: { type: string, description: Commit message }
+            examples:
+              create_file: { summary: Create a new file, value: { branch: "feature/ai-docs", path: "docs/architecture.md", content: "# Architecture\n...", message: "docs: add architecture overview" } }
+      responses:
+        '201':
+          description: File committed successfully
+
+  /git/repos/{owner}/{repo}/pulls:
+    post:
+      tags: [Git]
+      summary: Create a pull request
+      description: GitHub PAT is injected automatically from the user's saved Settings — do not include a token in the request body.
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string } }
+        - { name: repo, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [head, base, title]
+              properties:
+                head: { type: string, description: Source branch }
+                base: { type: string, description: Target branch }
+                title: { type: string }
+                body: { type: string }
+      responses:
+        '201':
+          description: Pull request created
+
+  /git/repos/{owner}/{repo}/branches:
+    post:
+      tags: [Git]
+      summary: Create a branch
+      description: GitHub PAT is injected automatically from the user's saved Settings — do not include a token in the request body.
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string } }
+        - { name: repo, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, fromBranch]
+              properties:
+                name: { type: string, description: New branch name }
+                fromBranch: { type: string, description: Source branch to create from }
+      responses:
+        '201':
+          description: Branch created
+
+  # ═══ Project Audits ═══
+
+  /projects/{id}/audits:
+    get:
+      tags: [Audits]
+      summary: List project audits
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 20 } }
+        - name: source
+          in: query
+          schema: { type: string, enum: [git, jira, confluence, sharepoint, web, manual, ai_analysis] }
+      responses:
+        '200':
+          description: Paginated list of audits
+    post:
+      tags: [Audits]
+      summary: Run a project audit
+      description: |
+        Triggers an audit from the specified source. For git audits, extracts repository analytics.
+        Results are stored in the audit table and can be further analyzed with LLM.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [source, sourceUrl]
+              properties:
+                source: { type: string, enum: [git, jira, confluence, sharepoint, web, manual] }
+                sourceUrl: { type: string, format: uri }
+                moduleId: { type: string, format: uuid, description: Optional module to scope the audit to }
+            examples:
+              git_audit: { summary: GitHub audit, value: { source: git, sourceUrl: "https://github.com/example-org/my-app" } }
+              jira_audit: { summary: Jira audit, value: { source: jira, sourceUrl: "https://example.atlassian.net/browse/PROJ-123" } }
+      responses:
+        '201':
+          description: Audit created with results
+
+  /projects/{id}/audits/{auditId}:
+    get:
+      tags: [Audits]
+      summary: Get audit detail
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: auditId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Full audit data including AI analysis
+    delete:
+      tags: [Audits]
+      summary: Delete own audit
+      description: Soft-deletes an audit record. Users can only delete audits they created.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: auditId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '204': { description: Audit deleted }
+        '403': { description: Cannot delete audits created by other users }
+
+  /projects/{id}/audits/{auditId}/export/json:
+    get:
+      tags: [Audits]
+      summary: Export audit as JSON file
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: auditId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: JSON file download
+
+  /projects/{id}/audits/{auditId}/export/md:
+    get:
+      tags: [Audits]
+      summary: Export audit as Markdown file
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: auditId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Markdown file download
+
+  /projects/{id}/audits/{auditId}/export/docx:
+    get:
+      tags: [Audits]
+      summary: Export audit as DOCX document
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: auditId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: DOCX file download (Arial font, styled tables, color-coded scores)
+
+  /projects/{id}/audits/{auditId}/analyze:
+    post:
+      tags: [Audits]
+      summary: Run LLM analysis on an audit
+      description: |
+        Sends the audit data to an LLM for structured analysis. Returns findings, recommendations,
+        completion estimates, and an overall score. Supports Claude, Gemini, and Grok.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: auditId, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider]
+              properties:
+                provider: { type: string, enum: [claude, gemini, grok] }
+                prompt: { type: string, description: Optional custom prompt to guide the analysis }
+            examples:
+              claude: { summary: Analyze with Claude, value: { provider: claude } }
+              with_prompt: { summary: Custom prompt, value: { provider: claude, prompt: "Focus on security patterns and test coverage" } }
+      responses:
+        '200':
+          description: LLM analysis results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      overallScore: { type: integer, minimum: 0, maximum: 100 }
+                      completionEstimate: { type: integer, minimum: 0, maximum: 100 }
+                      findings:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            category: { type: string }
+                            severity: { type: string, enum: [info, warning, critical] }
+                            description: { type: string }
+                            evidence: { type: string }
+                      recommendations: { type: array, items: { type: string } }
+                      summary: { type: string }
+
+  # ═══ Deep Audits ═══
+
+  /projects/{id}/deep-audit:
+    post:
+      tags: [Deep Audit]
+      summary: Run a deep code audit
+      description: |
+        Triggers a multi-phase deep audit of a GitHub repository:
+        1. **Discovery** — Scans entire file tree via GitHub Trees API
+        2. **Selection** — AI selects top N files most relevant for production readiness audit
+        3. **Loading** — Fetches selected file contents (with size limits)
+        4. **Analysis** — Batched LLM analysis of code quality, tests, security, completeness
+        5. **Consolidation** — Merges batch results into a final comprehensive report
+
+        Returns immediately with a running audit record. Progress is streamed via SSE.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [sourceUrl]
+              properties:
+                sourceUrl: { type: string, format: uri }
+                branch: { type: string, default: main }
+                maxFiles: { type: integer, default: 200, minimum: 10, maximum: 500, description: Max files for AI to select }
+                maxContentKB: { type: integer, default: 500, minimum: 100, maximum: 2000, description: Total content size limit in KB }
+                provider: { type: string, enum: [claude, gemini, grok], default: claude }
+                model: { type: string }
+            examples:
+              default: { summary: Default deep audit, value: { sourceUrl: "https://github.com/example-org/my-app" } }
+              custom: { summary: Custom options, value: { sourceUrl: "https://github.com/example-org/my-app", branch: dev, maxFiles: 300, provider: claude, model: "claude-sonnet-4-20250514" } }
+      responses:
+        '201':
+          description: Deep audit queued (running in background)
+
+  /projects/{id}/deep-audit/{auditId}/stream:
+    get:
+      tags: [Deep Audit]
+      summary: SSE stream for deep audit progress
+      description: |
+        Server-Sent Events stream that reports deep audit progress in real-time.
+        Events: `phase` (started/completed), `progress` (file loading, batch analysis), `complete`, `error`.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: auditId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+
+  /projects/{id}/deep-audit/{auditId}/status:
+    get:
+      tags: [Deep Audit]
+      summary: Get deep audit progress status
+      description: Returns current phase and progress for a running or completed deep audit.
+      security: []
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: auditId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Audit status and progress data
+
+  # ═══ Settings ═══
+
+  /settings/pat:
+    put:
+      tags: [Settings]
+      summary: Save GitHub PAT (encrypted)
+      description: Encrypts and stores the user's GitHub Personal Access Token for repository access.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pat]
+              properties:
+                pat: { type: string, minLength: 1, description: GitHub PAT (ghp_...) }
+      responses:
+        '200':
+          description: PAT saved successfully
+    delete:
+      tags: [Settings]
+      summary: Remove saved GitHub PAT
+      responses:
+        '200':
+          description: PAT removed
+
+  /settings/github-domain:
+    put:
+      tags: [Settings]
+      summary: Save GitHub URL — auto-extracts domain + org (runner+ role)
+      description: |
+        Accepts a full GitHub URL like `https://github.com/example-org`.
+        Velo parses it automatically: domain=`github.com`, org=`example-org`.
+        The org is auto-injected into repo creation calls so API consumers never need to specify it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [domain]
+              properties:
+                domain: { type: string, description: 'GitHub URL (e.g. https://github.com/MyOrg) — domain and org are extracted automatically' }
+      responses:
+        '200':
+          description: Parsed and saved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      domain: { type: string, description: 'Extracted hostname (e.g. github.com)' }
+                      org: { type: string, nullable: true, description: 'Extracted organization (e.g. example-org)' }
+
+  /settings/pat/status:
+    get:
+      tags: [Settings]
+      summary: Check if a GitHub PAT is configured
+      responses:
+        '200':
+          description: PAT status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      configured: { type: boolean }
+                      systemPat: { type: boolean, description: Whether a system-level GITHUB_PAT is configured }
+
+  # ═══ SharePoint Integration ═══
+
+  /sharepoint/status:
+    get:
+      tags: [SharePoint]
+      summary: Check SharePoint connection status
+      description: Returns whether SharePoint is configured and reachable, along with site and drive IDs.
+      security: []
+      responses:
+        '200':
+          description: Connection status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      connected: { type: boolean }
+                      siteId: { type: string }
+                      siteName: { type: string }
+                      driveId: { type: string }
+                      error: { type: string }
+
+  /sharepoint/projects/{projectId}/folders:
+    parameters:
+      - { name: projectId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [SharePoint]
+      summary: Create project folder hierarchy
+      x-required-roles: [runner, project_lead, admin]
+      description: |
+        **Requires role: runner, project_lead, or admin.**
+
+        Ensures the standard SharePoint folder structure exists for a project:
+        `/Velo Projects/{ProjectName}/`, `/Velo Projects/{ProjectName}/Audits/`,
+        `/Velo Projects/{ProjectName}/{ModuleName}/`,
+        `/Velo Projects/{ProjectName}/{ModuleName}/{StepName}/` for each velocity step.
+        Idempotent — safe to call multiple times.
+      responses:
+        '200':
+          description: Folders created or already exist
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      folders:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            folderType: { type: string, enum: [project, module, step, audit] }
+                            path: { type: string }
+                            webUrl: { type: string, format: uri }
+    get:
+      tags: [SharePoint]
+      summary: List tracked SharePoint folders for a project
+      responses:
+        '200':
+          description: Array of sharepoint_folder records
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        pk_sharepoint_folder: { type: string, format: uuid }
+                        sp_folder_path: { type: string }
+                        sp_web_url: { type: string, format: uri }
+                        folder_type: { type: string, enum: [project, module, step, audit] }
+                        sync_status: { type: string, enum: [active, orphaned, error] }
+
+  /sharepoint/folders/{folderId}/files:
+    parameters:
+      - { name: folderId, in: path, required: true, schema: { type: string, format: uuid }, description: pk_sharepoint_folder UUID }
+    get:
+      tags: [SharePoint]
+      summary: List files in a SharePoint folder
+      responses:
+        '200':
+          description: Array of Graph API driveItem objects
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        name: { type: string }
+                        size: { type: integer }
+                        webUrl: { type: string, format: uri }
+                        lastModifiedDateTime: { type: string, format: date-time }
+                        file: { type: object, properties: { mimeType: { type: string } } }
+                        folder: { type: object, properties: { childCount: { type: integer } } }
+    post:
+      tags: [SharePoint]
+      summary: Upload a file to a SharePoint folder
+      description: "**Requires role: runner, project_lead, or admin.** Uploaded files are automatically enqueued for AI shadow processing (PDF, images, DOCX, PPTX, XLSX)."
+      x-required-roles: [runner, project_lead, admin]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The file to upload (max 50MB)
+      responses:
+        '200':
+          description: Uploaded file metadata (Graph API driveItem)
+
+  /sharepoint/items/{itemId}/children:
+    parameters:
+      - { name: itemId, in: path, required: true, schema: { type: string }, description: SharePoint driveItem ID }
+    get:
+      tags: [SharePoint]
+      summary: List children (files + subfolders) of a SharePoint item
+      description: |
+        Uses SharePoint as the source of truth. Returns files AND subfolders directly from
+        the Microsoft Graph API — no database lookup required. Use this to browse into
+        subfolders that may not be tracked in the Velo database.
+      responses:
+        '200':
+          description: Array of Graph API driveItem objects (files and folders)
+
+  /sharepoint/items/{itemId}/subfolder:
+    parameters:
+      - { name: itemId, in: path, required: true, schema: { type: string }, description: SharePoint driveItem ID }
+    post:
+      tags: [SharePoint]
+      summary: Create a subfolder inside a SharePoint folder by item ID
+      description: "**Requires role: runner, project_lead, or admin.** Creates a subfolder directly in SharePoint using the Graph API."
+      x-required-roles: [runner, project_lead, admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, description: Folder name }
+      responses:
+        '201':
+          description: Created folder driveItem
+
+  /sharepoint/items/{itemId}/files:
+    parameters:
+      - { name: itemId, in: path, required: true, schema: { type: string }, description: SharePoint driveItem ID }
+    post:
+      tags: [SharePoint]
+      summary: Upload a file to a SharePoint folder by item ID
+      x-required-roles: [runner, project_lead, admin]
+      description: |
+        **Requires role: runner, project_lead, or admin.**
+
+        Upload a file directly to any SharePoint folder using its Graph driveItem ID.
+        Use this when browsing into subfolders not tracked in the Velo database.
+        Uploaded files are automatically enqueued for AI shadow processing.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          description: Uploaded file metadata (Graph API driveItem)
+
+  /sharepoint/files/{itemId}/download:
+    parameters:
+      - { name: itemId, in: path, required: true, schema: { type: string }, description: SharePoint driveItem ID }
+    get:
+      tags: [SharePoint]
+      summary: Download or preview a file from SharePoint
+      description: |
+        Returns file content. By default sets Content-Disposition to attachment (download).
+        Pass `?inline=true` to set Content-Disposition to inline for browser preview.
+        Inline mode is restricted to safe MIME types (PDF, images, plain text) to prevent XSS.
+        Includes Content-Security-Policy headers when serving inline content.
+      parameters:
+        - name: inline
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: "Set to true for inline display (PDF viewer, image preview). Only safe MIME types are served inline."
+      responses:
+        '200':
+          description: File content with appropriate Content-Type and Content-Disposition headers
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+
+  /sharepoint/files/{itemId}/metadata:
+    parameters:
+      - { name: itemId, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [SharePoint]
+      summary: Get file metadata from SharePoint
+      responses:
+        '200':
+          description: Graph API driveItem object with full metadata
+
+  /sharepoint/files/{itemId}/content:
+    parameters:
+      - { name: itemId, in: path, required: true, schema: { type: string }, description: SharePoint driveItem ID }
+    put:
+      tags: [SharePoint]
+      summary: Overwrite an existing file's content in place
+      x-required-roles: [runner, project_lead]
+      description: |
+        **Requires role: runner or project_lead.**
+
+        Replaces the body of an existing SharePoint file while preserving its
+        driveItem ID, version history, and SharePoint webUrl. Used by the
+        inline document editor. Uses a Graph upload session for payloads
+        larger than 4MB (max 250MB).
+
+        Triggers SSE `sharepoint_file_updated`. Re-enqueues AI shadow
+        processing unless the file is itself an AI shadow (`__AI__` prefix).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                content: { type: string, description: "New UTF-8 file content (max 250MB)" }
+      responses:
+        '200':
+          description: Updated Graph driveItem
+
+  /sharepoint/files/{itemId}:
+    parameters:
+      - { name: itemId, in: path, required: true, schema: { type: string } }
+    delete:
+      tags: [SharePoint]
+      summary: Delete a file from SharePoint
+      x-required-roles: [runner, project_lead, admin]
+      description: "**Requires role: runner, project_lead, or admin.**"
+      responses:
+        '204': { description: File deleted }
+
+  /sharepoint/modules/{moduleId}/steps/{stepName}/artifacts:
+    parameters:
+      - { name: moduleId, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: stepName, in: path, required: true, schema: { type: string, enum: [requirements, planning, architecture, prototyping, development, user_testing, user_acceptance, deployment] } }
+    get:
+      tags: [SharePoint]
+      summary: List artifacts for a velocity step
+      description: Returns files stored in the SharePoint folder mapped to this module's velocity step.
+      responses:
+        '200':
+          description: Array of files in the step folder
+    post:
+      tags: [SharePoint]
+      summary: Upload artifact to a velocity step folder
+      x-required-roles: [runner, project_lead, admin]
+      description: |
+        **Requires role: runner, project_lead, or admin.**
+
+        Uploads a file to the SharePoint folder for the given module's velocity step.
+        Auto-creates the folder hierarchy if it doesn't exist yet.
+        Uploaded files are automatically enqueued for AI shadow processing.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '200':
+          description: Uploaded artifact metadata
+
+  /sharepoint/projects/{projectId}/audit:
+    parameters:
+      - { name: projectId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [SharePoint]
+      summary: Run a SharePoint deep content audit
+      x-required-roles: [runner, project_lead, admin]
+      description: |
+        **Requires role: runner, project_lead, or admin.**
+
+        5-phase pipeline mirroring GitHub deep audits:
+        1. **Discovery** — Enumerate all SharePoint folders and files
+        2. **Selection** — Prioritize files by name/type/folder (requirements, architecture, plans rank highest)
+        3. **Loading** — Read content of selected files in batches (text-based files only, up to maxContentKB per file)
+        4. **Analysis** — LLM analyzes content against project metadata, module structure, and velocity step completeness
+        5. **Consolidation** — Save structured results (module completeness, key artifacts, recommendations)
+        Returns immediately with an audit ID; processing runs asynchronously with SSE progress events.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                provider: { type: string, enum: [claude, gemini, grok], description: LLM provider for deep content analysis }
+                model: { type: string, description: Specific model override }
+                maxFiles: { type: integer, default: 100, description: Maximum files to read content from }
+                maxContentKB: { type: integer, default: 300, description: Maximum KB to read per file }
+      responses:
+        '202':
+          description: Audit started
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      auditId: { type: string, format: uuid }
+                      status: { type: string, enum: [running] }
+
+  /sharepoint/projects/{projectId}/audit/{auditId}/export:
+    parameters:
+      - { name: projectId, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: auditId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [SharePoint]
+      summary: Export audit report to SharePoint
+      x-required-roles: [runner, project_lead, admin]
+      description: "**Requires role: runner, project_lead, or admin.** Generates a markdown report from the audit results and uploads it to the project's Audits folder."
+      responses:
+        '200':
+          description: Report uploaded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      webUrl: { type: string, format: uri }
+                      filename: { type: string }
+
+  /sharepoint/search:
+    get:
+      tags: [SharePoint]
+      summary: Search files across SharePoint
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string, minLength: 1, maxLength: 200 } }
+      responses:
+        '200':
+          description: Search results (array of driveItems matching the query)
+
+  /sharepoint/files/{itemId}/rename:
+    parameters:
+      - { name: itemId, in: path, required: true, schema: { type: string } }
+    patch:
+      tags: [SharePoint]
+      summary: Rename a file or folder
+      x-required-roles: [runner, project_lead, admin]
+      description: "**Requires role: runner, project_lead, or admin.**"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 255 }
+      responses:
+        '200': { description: Updated driveItem with new name }
+
+  /sharepoint/files/{itemId}/move:
+    parameters:
+      - { name: itemId, in: path, required: true, schema: { type: string } }
+    patch:
+      tags: [SharePoint]
+      summary: Move a file or folder to a different parent folder
+      x-required-roles: [runner, project_lead, admin]
+      description: "**Requires role: runner, project_lead, or admin.**"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [targetFolderId]
+              properties:
+                targetFolderId: { type: string, description: SharePoint driveItem ID of the destination folder }
+                newName: { type: string, description: Optional new name after move }
+      responses:
+        '200': { description: Updated driveItem at new location }
+
+  /sharepoint/folders/{folderId}/folder:
+    parameters:
+      - { name: folderId, in: path, required: true, schema: { type: string, format: uuid }, description: pk_sharepoint_folder UUID }
+    delete:
+      tags: [SharePoint]
+      summary: Delete a folder and all its contents
+      x-required-roles: [runner, project_lead, admin]
+      description: "**Requires role: runner, project_lead, or admin.** Permanently deletes the SharePoint folder and all files within it. Also soft-deletes the tracking record."
+      responses:
+        '200': { description: Folder deleted }
+
+  /sharepoint/folders/{folderId}/subfolder:
+    parameters:
+      - { name: folderId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [SharePoint]
+      summary: Create a new subfolder
+      x-required-roles: [runner, project_lead, admin]
+      description: "**Requires role: runner, project_lead, or admin.** Creates subfolder and inserts tracking record in DB."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 255 }
+      responses:
+        '200': { description: Created subfolder driveItem }
+
+  # ═══ User Management (Admin) ═══
+
+  /users:
+    post:
+      tags: [User Management]
+      summary: Pre-register a user before first login (admin only)
+      description: |
+        Creates a user record with assigned roles before they log in via SSO.
+        When the user first signs in, their pre-assigned roles are automatically applied.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                displayName: { type: string }
+                roles:
+                  type: array
+                  items: { type: string, enum: [user, project_lead, runner, admin] }
+      responses:
+        '201':
+          description: User pre-registered
+    get:
+      tags: [User Management]
+      summary: List all users with roles (admin only)
+      description: Returns all registered users with their assigned roles, login history, and account status.
+      security: [{ apiKeyHeader: [] }]
+      responses:
+        '200':
+          description: Array of user objects with roles
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        pk_user_account: { type: string, format: uuid }
+                        user_email_address: { type: string, format: email }
+                        user_display_name: { type: string }
+                        user_role_name: { type: string, enum: [user, project_lead, runner, admin] }
+                        roles: { type: array, items: { type: string, enum: [user, project_lead, runner, admin] } }
+                        is_active: { type: boolean }
+                        last_login_at: { type: string, format: date-time, nullable: true }
+                        created_at: { type: string, format: date-time }
+        '403': { description: Admin role required }
+
+  /users/{userId}:
+    parameters:
+      - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [User Management]
+      summary: Get user details with roles (admin only)
+      responses:
+        '200': { description: User object with roles array }
+
+  /users/{userId}/roles:
+    parameters:
+      - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [User Management]
+      summary: Add a role to a user (admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role:
+                  type: string
+                  enum: [user, project_lead, runner, admin]
+                  description: |
+                    Role to add. Users can have multiple roles simultaneously.
+                    - user: Basic read access
+                    - project_lead: Create/edit projects, run audits, manage modules
+                    - runner: Use the velocity game (make moves, send back, lock steps)
+                    - admin: Full access including user management
+      responses:
+        '200':
+          description: Updated roles array
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      roles: { type: array, items: { type: string } }
+
+  /users/{userId}/roles/{role}:
+    parameters:
+      - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+      - { name: role, in: path, required: true, schema: { type: string, enum: [user, project_lead, runner, admin] } }
+    delete:
+      tags: [User Management]
+      summary: Remove a role from a user (admin only)
+      description: Cannot remove last role. Admin cannot remove own admin role.
+      responses:
+        '200': { description: Updated roles array }
+
+  /users/{userId}/active:
+    parameters:
+      - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+    patch:
+      tags: [User Management]
+      summary: Enable or disable a user account (admin only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [active]
+              properties:
+                active: { type: boolean }
+      responses:
+        '200': { description: Account status updated }
+
+  # ═══ SharePoint AI Processing ═══
+
+  /sharepoint/files/{itemId}/process:
+    parameters:
+      - { name: itemId, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [SharePoint]
+      summary: Process a file into an AI-ready shadow version
+      x-required-roles: [runner, project_lead, admin]
+      description: |
+        **Requires role: runner, project_lead, or admin.**
+
+        Generates an __AI__ prefixed shadow file in Markdown from PDFs (page-by-page OCR),
+        images (visual recognition), DOCX (text + vision fallback), PPTX (slide extraction + image vision),
+        or XLSX (table conversion). Supports both Gemini and Claude vision. Skips unchanged files (cTag comparison).
+        Processing runs in background — returns 202 immediately.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [folderId]
+              properties:
+                folderId: { type: string, format: uuid, description: pk_sharepoint_folder of the parent folder }
+                provider: { type: string, enum: [gemini, claude], description: Vision AI provider (default auto-detect) }
+                force: { type: boolean, default: false, description: Reprocess even if source file unchanged }
+      responses:
+        '202': { description: Processing started in background }
+
+  /sharepoint/folders/{folderId}/process-all:
+    parameters:
+      - { name: folderId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [SharePoint]
+      summary: Process all eligible files in a folder into AI-ready shadows
+      x-required-roles: [runner, project_lead, admin]
+      description: "**Requires role: runner, project_lead, or admin.** Processes PDFs, images, DOCX, PPTX, and XLSX files. Skips files with up-to-date shadows unless force=true."
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                force: { type: boolean, default: false }
+      responses:
+        '202': { description: Processing started for all eligible files }
+
+  /sharepoint/folders/{folderId}/import-zip:
+    parameters:
+      - { name: folderId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [SharePoint]
+      summary: Import a ZIP file — extract folders and files into SharePoint
+      x-required-roles: [runner, project_lead, admin]
+      description: |
+        **Requires role: runner, project_lead, or admin.**
+
+        Upload a ZIP archive. Its folder/file structure is recreated inside the target SharePoint folder.
+        Useful for importing entire project documentation sets. All imported files are automatically
+        enqueued for AI shadow processing. Triggers SSE sharepoint_import event.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary, description: ZIP file (max 50MB) }
+      responses:
+        '200':
+          description: Import results with counts of created folders and uploaded files
+
+  /sharepoint/folders/{folderId}/blank-file:
+    parameters:
+      - { name: folderId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [SharePoint]
+      summary: Create a new file from typed content (New Document)
+      x-required-roles: [runner, project_lead]
+      description: |
+        **Requires role: runner or project_lead.**
+
+        Creates a brand-new file in the SharePoint folder from a caller-supplied
+        filename + UTF-8 text body. Backs the "New Document" dialog in the UI.
+        Filename validator blocks SharePoint-illegal characters (`" * : < > ? / \ |`),
+        ASCII control chars, `.`, `..`, and trailing dot/space. Leading dots are
+        allowed (`.env`, `.gitignore`). Max content size 250MB.
+
+        Triggers SSE `sharepoint_file_uploaded`. Enqueues AI shadow processing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filename]
+              properties:
+                filename: { type: string, description: "Filename with extension (1–255 chars)" }
+                content:  { type: string, description: "UTF-8 file body (defaults to empty)" }
+      responses:
+        '201':
+          description: Created Graph driveItem
+
+  /sharepoint/folders/{folderId}/export-zip:
+    parameters:
+      - { name: folderId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [SharePoint]
+      summary: Export a folder as a ZIP file
+      description: Downloads the folder and all its contents (recursively) as a ZIP archive.
+      responses:
+        '200':
+          description: ZIP file download
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+
+  /sharepoint/ai-queue:
+    get:
+      tags: [SharePoint]
+      summary: Get AI background processing queue status
+      description: |
+        Returns the current state of the server-side AI processing queue. Files are
+        automatically enqueued for AI shadow processing when uploaded via any path
+        (single upload, ZIP import, step artifacts, API). Processing runs in the
+        background with concurrency control — no browser connection needed.
+      responses:
+        '200':
+          description: Queue status with pending and processing counts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      pending: { type: integer, description: Files waiting to be processed }
+                      processing: { type: integer, description: Files currently being processed }
+                      items:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            filename: { type: string }
+                            status: { type: string, enum: [pending, processing] }
+
+  /sharepoint/ai-queue/jobs:
+    get:
+      tags: [SharePoint]
+      summary: Get detailed AI processing jobs with sub-jobs
+      description: |
+        Returns recent jobs (active + last 24h) with full sub-job detail.
+        Optional folderId parameter filters to a specific SharePoint folder.
+      parameters:
+        - { name: folderId, in: query, required: false, schema: { type: string }, description: "DB folder UUID or SharePoint item ID to filter by" }
+      responses:
+        '200':
+          description: Array of jobs with nested sub-jobs
+
+  /sharepoint/ai-queue/jobs/{jobId}/retry:
+    parameters:
+      - { name: jobId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [SharePoint]
+      summary: Retry a failed AI processing job
+      x-required-roles: [runner, project_lead, admin]
+      description: "**Requires role: runner, project_lead, or admin.** Clears old sub-jobs and requeues the job for processing."
+      responses:
+        '200':
+          description: Job requeued
+
+  /sharepoint/items/{itemId}/import-zip:
+    parameters:
+      - { name: itemId, in: path, required: true, schema: { type: string }, description: SharePoint driveItem ID }
+    post:
+      tags: [SharePoint]
+      summary: Import a ZIP into any SharePoint folder by item ID
+      x-required-roles: [runner, project_lead, admin]
+      description: |
+        **Requires role: runner, project_lead, or admin.**
+
+        Upload a ZIP archive and extract its contents into the target folder identified by
+        SharePoint driveItem ID. Uses disk-based streaming for ZIPs up to 2GB.
+        All imported files are automatically enqueued for AI shadow processing.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary, description: ZIP file (max 2GB) }
+      responses:
+        '200':
+          description: Import results with folder/file counts
+
+  /sharepoint/items/{itemId}/blank-file:
+    parameters:
+      - { name: itemId, in: path, required: true, schema: { type: string }, description: SharePoint driveItem ID }
+    post:
+      tags: [SharePoint]
+      summary: Create a new file in a folder addressed by Graph item ID
+      x-required-roles: [runner, project_lead]
+      description: |
+        **Requires role: runner or project_lead.**
+
+        Same as POST /sharepoint/folders/{folderId}/blank-file, but targets the
+        folder by its Graph driveItem ID (used when the user has browsed into
+        a subfolder not tracked in the Velo database).
+
+        Triggers SSE `sharepoint_file_uploaded`. Enqueues AI shadow processing.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [filename]
+              properties:
+                filename: { type: string, description: "Filename with extension (1–255 chars)" }
+                content:  { type: string, description: "UTF-8 file body (defaults to empty)" }
+      responses:
+        '201':
+          description: Created Graph driveItem
+
+  /sharepoint/folders/{folderId}/ai-status:
+    parameters:
+      - { name: folderId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [SharePoint]
+      summary: Check AI shadow file staleness for a folder
+      description: Single API call to SharePoint. Compares original file timestamps with shadow file timestamps to detect which need reprocessing.
+      responses:
+        '200':
+          description: Staleness report
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      total: { type: integer, description: Total processable files }
+                      upToDate: { type: integer }
+                      stale: { type: integer, description: Shadow exists but source was edited }
+                      missing: { type: integer, description: No shadow file exists }
+                      staleFiles: { type: array, items: { type: string } }
+                      missingFiles: { type: array, items: { type: string } }
+
+  # ═══ Leaderboard & Points ═══
+
+  /leaderboard:
+    get:
+      tags: [Leaderboard]
+      summary: Get ranked leaderboard
+      description: Returns users ranked by total points. Supports period filtering for month/year/all-time views.
+      parameters:
+        - { name: period, in: query, schema: { type: string, enum: [month, year, all], default: all } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+      responses:
+        '200':
+          description: Ranked leaderboard entries
+
+  /leaderboard/me:
+    get:
+      tags: [Leaderboard]
+      summary: Get current user's points and recent history
+      responses:
+        '200': { description: Total points and last 20 point events }
+
+  /leaderboard/user/{userId}/history:
+    parameters:
+      - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Leaderboard]
+      summary: Get point audit trail for a user
+      description: Full history of every point event — what was earned/lost, why, which project/module/step, and when.
+      responses:
+        '200': { description: Array of point events with project/module/step details }
+
+  /leaderboard/project/{projectId}/contributors:
+    parameters:
+      - { name: projectId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Leaderboard]
+      summary: All contributors to a project with point breakdown
+      responses:
+        '200': { description: Contributors with total points, actions, modules touched }
+
+  /leaderboard/module/{moduleId}/contributors:
+    parameters:
+      - { name: moduleId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Leaderboard]
+      summary: All contributors to a module with per-step history
+      responses:
+        '200': { description: Contributors with per-step point history }
+
+  /leaderboard/refresh:
+    post:
+      tags: [Leaderboard]
+      summary: Refresh materialized leaderboard view (admin only)
+      responses:
+        '200': { description: Leaderboard refreshed }
+
+  /leaderboard/reaper/run:
+    post:
+      tags: [Leaderboard]
+      summary: Run the Reaper — audit for cheating and invert offender points (admin only)
+      x-required-roles: [admin]
+      description: |
+        **Requires role: admin.**
+
+        Full-corpus audit that walks every completed velocity step, every
+        module, and every project, applying five detection rules:
+
+          * `speed_run` — completed step where every turn was the same `ai`
+            actor (no human collaboration).
+          * `no_artifact` — completed step with zero attachments across all
+            turns.
+          * `no_collaboration` — completed step touched by only one distinct
+            actor (broader than speed_run; can also flag a solo human).
+          * `blank_module` — module with completed steps but minimal turn
+            content + minimal metadata (description / plan / progress).
+          * `project_module_overflow` — project with ≥ 10 modules (a heuristic
+            for padded projects added to farm points).
+
+        For each detected violation, inserts a `cheating_violation` row and
+        a paired `user_points` row with negative `cheating_penalty` value
+        sized `-2 × original_points` so the user's net score for that scope
+        flips from +N to −N. Refreshes the leaderboard materialized view at
+        the end so the UI shows updated `violations_count` immediately.
+
+        **Idempotent.** Unique constraints on `(user, scope, type)` prevent
+        double-flagging — re-running the Reaper only appends new findings.
+      responses:
+        '200':
+          description: |
+            Reaper report — scanned counts, violations created, total points
+            inverted, breakdown by violation type, and per-user impact
+            sorted descending by violation count.
+
+  /leaderboard/redemption/run:
+    post:
+      tags: [Leaderboard]
+      summary: Forgive negative balances (admin only)
+      x-required-roles: [admin]
+      description: |
+        Inverse of the Reaper. For every user whose current total is
+        negative, inserts a positive `redemption` `user_points` row exactly
+        large enough to bring them to zero. `cheating_violation` history
+        is preserved — the Skull badge and `violations_count` column
+        remain populated as a permanent audit record. Refreshes the
+        leaderboard materialized view at the end.
+
+        **Idempotent.** A second run with no remaining negative users
+        is a no-op.
+      responses:
+        '200':
+          description: |
+            Redemption report — `redeemedUsers` count, total `pointsForgiven`,
+            and per-user `details` (prior total, redemption points credited)
+            sorted ascending by prior total (deepest negative first).
+
+  /leaderboard/violations:
+    get:
+      tags: [Leaderboard]
+      summary: List detected cheating violations (admin only)
+      x-required-roles: [admin]
+      description: |
+        Forensic table for admin review. Each row includes the user, the
+        scope (project / module / step), the violation type, the original
+        points earned, the inverted (negative) deduction, and the diagnostic
+        evidence JSON captured at detection time. Newest first.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, default: 200, maximum: 1000 }
+      responses:
+        '200':
+          description: Array of violations with joined user + project + module + step names.
+
+  /leaderboard/user/{userId}/violations:
+    parameters:
+      - { name: userId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Leaderboard]
+      summary: Per-user violation breakdown
+      description: |
+        Returns a single user's cheating violations grouped by rule (`type`,
+        `count`, `total_inverted`) plus the top-5 most-painful example rows
+        per rule with project / module / step join data. Public to any
+        authenticated user — the leaderboard already displays the
+        public violation count and the biggest-cheater Skull badge.
+      responses:
+        '200':
+          description: |
+            `{ summary: [{ type, count, total_inverted }], examples: [...] }`.
+
+  # ═══ Challenges ═══
+
+  /challenges:
+    get:
+      tags: [Challenges]
+      summary: List challenges (mini-projects with bonus points)
+      description: |
+        Challenges are projects flagged with is_challenge=true. They have point values,
+        difficulty levels, and deadlines. Open challenges can be claimed by runners.
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [open, claimed, completed, all], default: all } }
+        - { name: difficulty, in: query, schema: { type: string, enum: [easy, medium, hard, expert] } }
+      responses:
+        '200': { description: Array of challenge objects with claimer info }
+
+  /challenges/{projectId}/claim:
+    parameters:
+      - { name: projectId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Challenges]
+      summary: Claim an open challenge (runner+ role)
+      description: Starts the clock. Complete within challenge_max_days for a 25% speed bonus.
+      responses:
+        '200': { description: Claimed challenge details }
+
+  /challenges/{projectId}/complete:
+    parameters:
+      - { name: projectId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Challenges]
+      summary: Complete a challenge and earn points (runner+ role)
+      description: Awards challenge_points to the claimer. Speed bonus if completed within deadline.
+      responses:
+        '200': { description: Points awarded details }
+
+  /challenges/{projectId}/unclaim:
+    parameters:
+      - { name: projectId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Challenges]
+      summary: Abandon a claimed challenge (runner+ role) — legacy single-claimer flow
+      responses:
+        '200': { description: Challenge unclaimed }
+
+  # ─── v5.1 multi-acceptance + winner-pick workflow ───
+
+  /challenges/{projectId}:
+    parameters:
+      - { name: projectId, in: path, required: true, schema: { type: string, format: uuid } }
+    get:
+      tags: [Challenges]
+      summary: Get a challenge and its acceptances (clones) (v5.1)
+      description: |
+        Returns the parent challenge plus every clone of it (each clone is one acceptance,
+        with its own owner and progress). Use this to render the challenge management page.
+      responses:
+        '200':
+          description: Challenge with acceptances
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      challenge: { type: object, description: "Parent challenge with derived acceptance_count, spots_remaining, is_full" }
+                      acceptances:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            pk_project:                { type: string, format: uuid }
+                            project_name:              { type: string }
+                            project_version_label:     { type: string, nullable: true }
+                            project_status:            { type: string }
+                            project_percent_complete:  { type: integer, nullable: true }
+                            project_is_locked:         { type: boolean }
+                            challenge_completed_at:    { type: string, format: date-time, nullable: true }
+                            primary_owner_name:        { type: string, nullable: true }
+                            primary_owner_email:       { type: string, format: email, nullable: true }
+
+  /challenges/{projectId}/accept:
+    parameters:
+      - { name: projectId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Challenges]
+      summary: Accept a challenge by cloning it (runner+ role) (v5.1)
+      description: |
+        Clones the challenge so the user can take it on independently. Each accepter
+        gets their own copy with their own velocity board, members, and progress.
+        Enforces `challenge_max_acceptances` (NULL = unlimited; integer = first-come,
+        first-served cap). If the user has already accepted, returns the existing clone
+        instead of creating a duplicate (idempotent at the user-membership level).
+
+        Errors:
+        - `403 CHALLENGE_CLOSED` — creator has closed the challenge
+        - `403 CHALLENGE_COMPLETED` — a winner has already been picked
+        - `409 CHALLENGE_FULL` — `challenge_max_acceptances` reached
+        - `422 CLONE_OF_CLONE` — attempted on a clone instead of the parent
+      responses:
+        '201':
+          description: Acceptance created (a new clone)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      pk_project:   { type: string, format: uuid }
+                      project_name: { type: string }
+                      project_code: { type: string, nullable: true }
+        '403': { description: CHALLENGE_CLOSED or CHALLENGE_COMPLETED }
+        '409': { description: CHALLENGE_FULL }
+        '422': { description: CLONE_OF_CLONE }
+
+  /challenges/{projectId}/close:
+    parameters:
+      - { name: projectId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Challenges]
+      summary: Close a challenge to further acceptances (creator/admin only) (v5.1)
+      description: |
+        Sets `challenge_closed_at` and flips `project_clone_disabled = true` so
+        no further acceptances (clones) can be made. Existing clones may still
+        be completed and one of them picked as winner.
+        Idempotent — already-closed challenges return their existing close timestamp.
+      responses:
+        '200':
+          description: Challenge closed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      challenge_closed_at: { type: string, format: date-time }
+        '403': { description: NOT_CHALLENGE_CREATOR }
+
+  /challenges/{projectId}/pick-winner:
+    parameters:
+      - { name: projectId, in: path, required: true, schema: { type: string, format: uuid } }
+    post:
+      tags: [Challenges]
+      summary: Pick the winning acceptance and award points (creator/admin only) (v5.1)
+      description: |
+        Sets `challenge_winner_project` on the parent, marks the winning clone as
+        `completion`/100%, and writes `user_points` rows for the winner's active owner(s).
+        When multiple co-owners exist, points are split equally (floor); the same goes
+        for the speed bonus when applicable. The optional `narrative` is shown alongside
+        the winner badge in the UI.
+
+        The winner project must be either the parent itself (if no acceptances) or
+        an active acceptance (clone) of it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [winnerProjectId]
+              properties:
+                winnerProjectId: { type: string, format: uuid }
+                narrative:       { type: string, nullable: true, maxLength: 5000 }
+      responses:
+        '200':
+          description: Winner picked, points awarded
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      pointsAwarded: { type: integer, description: "Total challenge_points distributed across the winner's owners" }
+                      bonusAwarded:  { type: integer, description: "Speed bonus distributed (0 if past deadline or no max_days set)" }
+        '403': { description: NOT_CHALLENGE_CREATOR }
+        '409': { description: WINNER_ALREADY_PICKED }
+
+  # ═══ Health & Docs ═══
+  /health:
+    get: { tags: [Health], summary: Health check, security: [] }
+  /health/ready:
+    get: { tags: [Health], summary: Readiness check (includes DB connectivity), security: [] }
+  /health/live:
+    get: { tags: [Health], summary: Liveness probe (returns 200 if process is running), security: [] }
+  /docs:
+    get: { tags: [Documentation], summary: This OpenAPI specification (YAML), security: [] }
+
+  /_meta/sync:
+    get:
+      tags: [Health]
+      summary: Drift-detection metadata (migrations count, openapi version, env)
+      description: |
+        Returns the artifact identifiers that the docs-sync checker validates
+        against. Lets ops + agents detect drift in production by comparing the
+        running server's view of the world to whatever was committed to the repo.
+        Public — returns no PII or secrets.
+      security: []
+      responses:
+        '200':
+          description: Meta state
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  data:
+                    type: object
+                    properties:
+                      nodeVersion: { type: string, example: 'v22.15.1' }
+                      env:         { type: string, example: 'development' }
+                      startedAt:   { type: string, format: date-time }
+                      artifacts:
+                        type: object
+                        properties:
+                          migrationsOnDisk:  { type: integer }
+                          openapiVersion:    { type: string, nullable: true }
+                          openapiPathCount:  { type: integer, nullable: true }
+                          claudeMdPresent:   { type: boolean }
+
+  /landing:
+    get: { tags: [Landing], summary: Public landing-page content (counts, highlights), security: [] }
+
+  /auth/providers:
+    get: { tags: [Auth], summary: List enabled SSO providers (google, microsoft, etc.), security: [] }
+
+  # ═══ Files ═══
+  /files/upload:
+    post:
+      tags: [Files]
+      summary: Upload a binary file (multipart/form-data)
+      description: |
+        Generic file-upload endpoint. Validates magic bytes, MIME type, and size
+        before storing as BYTEA. Returns the new file's UUID.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: { type: string, format: binary }
+              required: [file]
+      responses:
+        '201': { description: File stored }
+        '400': { description: UNEXPECTED_FILE / FILE_TOO_LARGE }
+
+  # ═══ Resources (read-only public catalog) ═══
+  /resources:
+    get: { tags: [Resources], summary: List published resources, security: [] }
+  /resources/{id}:
+    get: { tags: [Resources], summary: Get a published resource, security: [] }
+  /resources/{id}/updates:
+    get: { tags: [Resources], summary: Get a resource's recent update entries, security: [] }
+
+  # ═══ Services & Service Locations (read-only public catalog) ═══
+  /services:
+    get: { tags: [Services], summary: List published services, security: [] }
+  /services/{id}:
+    get: { tags: [Services], summary: Get a published service, security: [] }
+  /service-locations:
+    get: { tags: [Services], summary: List published service locations, security: [] }
+  /service-locations/{id}:
+    get: { tags: [Services], summary: Get a published service location, security: [] }
+
+  # ═══ Forms (public schema + draft/submit) ═══
+  /forms/published:
+    get: { tags: [Forms], summary: List forms currently published to the public, security: [] }
+  /forms/{id}/schema:
+    get: { tags: [Forms], summary: Get a published form's JSON schema (FormKit), security: [] }
+  /forms/{id}/submissions:
+    post: { tags: [Forms], summary: Create a final submission against a form }
+  /forms/{id}/drafts:
+    post: { tags: [Forms], summary: Save a draft submission against a form }
+
+  # ═══ Submissions (user's own form submissions) ═══
+  /submissions:
+    get: { tags: [Submissions], summary: List the caller's own submissions (drafts + final) }
+  /submissions/{id}:
+    get: { tags: [Submissions], summary: Get a single submission owned by the caller }
+  /submissions/{id}/draft:
+    put: { tags: [Submissions], summary: Update a draft submission's payload }
+  /submissions/{id}/submit:
+    post: { tags: [Submissions], summary: Promote a draft to a final submission }
+  /submissions/{id}/retract:
+    post: { tags: [Submissions], summary: Retract a submitted submission (soft delete) }
+
+  # ═══ Notifications ═══
+  /notifications/stream:
+    get:
+      tags: [Notifications]
+      summary: SSE stream of in-app notifications for the caller
+      description: |
+        Server-Sent Events stream — keep open with `EventSource`. Emits a
+        `notification` event for each new in-app notification.
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream: { schema: { type: string } }
+  /notifications/unread-count:
+    get: { tags: [Notifications], summary: Count of unread notifications for the caller }
+  /notifications:
+    get: { tags: [Notifications], summary: List the caller's notifications (paginated) }
+  /notifications/{id}/read:
+    put: { tags: [Notifications], summary: Mark a notification as read }
+  /notifications/broadcast:
+    post: { tags: [Notifications], summary: Broadcast a notification to a target audience (admin/system) }
+
+  # ═══ Subscriptions (push channel preferences) ═══
+  /subscriptions:
+    get:  { tags: [Subscriptions], summary: List the caller's notification subscriptions }
+    post: { tags: [Subscriptions], summary: Create a notification subscription (e.g. project, module, topic) }
+  /subscriptions/{id}:
+    delete: { tags: [Subscriptions], summary: Delete a notification subscription }
+
+  # ═══ AI / LLM ═══
+  /ai/chat:
+    post:
+      tags: [AI]
+      summary: Multi-provider LLM chat endpoint (Claude, OpenAI, etc.) — streams via SSE
+      description: |
+        Streams LLM tokens back as Server-Sent Events. The body selects provider,
+        model, messages, and optional tool definitions.
+  /ai/analyze-image:
+    post:
+      tags: [AI]
+      summary: Multi-modal image analysis (vision-capable models)
+      description: Accepts a base64 image or URL plus a prompt; returns the model's analysis.
+  /ai/conversations:
+    get: { tags: [AI], summary: List the caller's saved AI conversations }
+  /ai/conversations/{conversationId}:
+    delete: { tags: [AI], summary: Delete a saved AI conversation (soft delete) }
+  /ai/conversations/{conversationId}/messages:
+    get: { tags: [AI], summary: List messages in a saved AI conversation }
+  /ai/conversations/{conversationId}/generate-title:
+    post: { tags: [AI], summary: Auto-generate a short title for a conversation from its history }
+
+  # ═══ Git — repo file browsing ═══
+  # NOTE: Express mounts this as `GET /git/repos/:owner/:repo/files/*` —
+  # the `*` is a wildcard segment (the file's repo-relative path, may contain `/`).
+  # The literal `*` is preserved as the OpenAPI path key so docs-sync can match it.
+  /git/repos/{owner}/{repo}/files/*:
+    get:
+      tags: [Git]
+      summary: Read a single file from a repo (any depth — wildcard segment is the path)
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string } }
+        - { name: repo,  in: path, required: true, schema: { type: string } }
+
+  # ═══ Admin — Dashboard ═══
+  /admin/dashboard/stats:
+    get: { tags: [Admin], summary: Aggregate counts for the admin dashboard }
+
+  # ═══ Admin — Resources CRUD ═══
+  /admin/resources:
+    post: { tags: [Admin, Resources], summary: Create a resource }
+  /admin/resources/{id}:
+    put: { tags: [Admin, Resources], summary: Update a resource }
+  /admin/resources/{id}/updates:
+    post: { tags: [Admin, Resources], summary: Append an update entry to a resource }
+
+  # ═══ Admin — Service Locations CRUD ═══
+  /admin/service-locations:
+    post: { tags: [Admin, Services], summary: Create a service location }
+  /admin/service-locations/{id}:
+    put: { tags: [Admin, Services], summary: Update a service location }
+
+  # ═══ Admin — Services CRUD ═══
+  /admin/services:
+    get:  { tags: [Admin, Services], summary: List all services (incl. unpublished) }
+    post: { tags: [Admin, Services], summary: Create a service }
+  /admin/services/{id}:
+    put: { tags: [Admin, Services], summary: Update a service }
+  /admin/service-categories:
+    get: { tags: [Admin, Services], summary: List all service categories (incl. unpublished) }
+
+  # ═══ Admin — Forms CRUD ═══
+  /admin/forms:
+    get:  { tags: [Admin, Forms], summary: List all forms (incl. unpublished) }
+    post: { tags: [Admin, Forms], summary: Create a form }
+  /admin/forms/{id}:
+    put: { tags: [Admin, Forms], summary: Update a form's schema or status }
+
+  # ═══ Admin — Submissions ═══
+  /admin/submissions:
+    get: { tags: [Admin, Submissions], summary: List all submissions across all users }
+  /admin/submissions/{id}/status:
+    put: { tags: [Admin, Submissions], summary: Change a submission's review status (e.g. approved/rejected) }
+
+  # ═══ Admin — Notifications ═══
+  /admin/notifications:
+    get: { tags: [Admin, Notifications], summary: List the system-wide notification audit log }
+  /admin/notifications/broadcast:
+    post: { tags: [Admin, Notifications], summary: Broadcast a notification to all users (or filtered audience) }
+
+  /admin/sse-sessions:
+    get:
+      tags: [Admin]
+      summary: Live Velocity SSE session snapshot (grouped by api_key / user / IP)
+      x-required-roles: [admin]
+      description: |
+        **Requires role: admin.**
+
+        Returns an in-memory snapshot of every currently-connected Velocity SSE
+        client on this Node process. Use to investigate connection surges and
+        identify the api_key_id, user, or source IP responsible for high load.
+
+        Returned groupings (each sorted descending by count, so a runaway caller
+        is always first):
+          - `byApiKey`: { apiKeyId, userEmail, userId, count, oldestConnectedAt }
+          - `byUser`:   { userId, userEmail, count, oldestConnectedAt }
+          - `byIp`:     { ip, count, oldestConnectedAt }
+          - `byAuth`:   counts keyed by authSource (api_key | jwt | anonymous)
+          - `sessions`: full list of active connections with userAgent + durationMs
+
+        Per-identity concurrency caps are enforced at SSE connect time and
+        configured via SSE_MAX_PER_API_KEY / SSE_MAX_PER_USER / SSE_MAX_PER_IP
+        (defaults 5 each). A 6th concurrent connection from the same identity
+        gets HTTP 429 + Retry-After: 60.
+
+        Single-instance only — this endpoint reflects only the local Node
+        process. On a multi-instance App Service, call each instance separately.
+      responses:
+        '200':
+          description: Current SSE session snapshot
+

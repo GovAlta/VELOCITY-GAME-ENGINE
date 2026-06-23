@@ -1,0 +1,29 @@
+{
+  "$comment": "Project-local Claude Code settings. Hooks below enforce docs-sync discipline so the agent doesn't declare a feature complete with stale README/openapi/CLAUDE.md.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node scripts/check-docs-sync.mjs --migrations-only 2>&1 | grep -E '✘|⚠' || true",
+            "$comment": "Cheap migration-count check after every Edit/Write. Surfaces drift immediately when a new migration is added but README count is stale."
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node scripts/check-docs-sync.mjs 2>&1 | tail -30",
+            "$comment": "Full drift check before Claude can mark the conversation complete. Surfaces every gap so the agent has a chance to fix them in this turn."
+          }
+        ]
+      }
+    ]
+  }
+}
